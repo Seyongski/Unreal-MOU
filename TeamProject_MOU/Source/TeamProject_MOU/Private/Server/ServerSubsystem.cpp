@@ -419,7 +419,7 @@ void UServerSubsystem::CreateRoom(const FString& Title, const FString& RoomPassw
 	// 전송 방식의 문제가 아니다. 백엔드가 바뀌어도 같은 규칙이어야 한다.
 	const FString EffectivePassword = IsValidRoomPassword(RoomPassword) ? RoomPassword : FString();
 
-	Backend->CreateRoom(Title, EffectivePassword, HostPort);
+	Backend->CreateRoom(Title, EffectivePassword, HostPort, GetLocalLanAddress());
 }
 
 void UServerSubsystem::RequestRoomList()
@@ -655,6 +655,7 @@ void UServerSubsystem::ClearRoomState()
 	// ★ 받아둔 출발 신호도 버린다. 남겨두면 다음 방에서 TravelToHost 가
 	//   지난 방의 주소로 떠난다.
 	PendingHostReady = FMOURoomJoinResult();
+	TriedCandidateIndex = INDEX_NONE;
 	TravelRoomPassword.Reset();
 }
 
@@ -805,8 +806,8 @@ bool UServerSubsystem::Tick(float DeltaTime)
 			if (Event.Join.bSuccess)
 			{
 				CurrentRoomId = Event.Join.RoomId;   // 대기실 입장. 방장은 아니다
-				UE_LOG(LogMOUServer, Log, TEXT("방 #%d 입장. 호스트는 %s:%d"),
-					Event.Join.RoomId, *Event.Join.HostAddress, Event.Join.HostPort);
+				UE_LOG(LogMOUServer, Log, TEXT("방 #%d 입장. 호스트 후보 %s"),
+					Event.Join.RoomId, *Event.Join.ToDisplayString());
 			}
 			else
 			{
@@ -841,8 +842,8 @@ bool UServerSubsystem::Tick(float DeltaTime)
 			// "리슨서버를 연다" 와 "기다린다" 로 갈리는데, 그 판단 근거가
 			// 이미 여기 있으므로 UI 가 다시 따지게 하지 않는다.
 			const bool bIsHost = (MyRoomId != 0 && MyRoomId == Event.RoomId);
-			UE_LOG(LogMOUServer, Log, TEXT("방 #%d 게임 시작. 호스트 %s:%d (나는 %s)"),
-				Event.RoomId, *Event.Join.HostAddress, Event.Join.HostPort,
+			UE_LOG(LogMOUServer, Log, TEXT("방 #%d 게임 시작. 호스트 후보 %s (나는 %s)"),
+				Event.RoomId, *Event.Join.ToDisplayString(),
 				bIsHost ? TEXT("방장") : TEXT("참여자"));
 
 			if (bIsHost)
@@ -860,6 +861,7 @@ bool UServerSubsystem::Tick(float DeltaTime)
 				bGuestWaitingForHostReady = true;
 				GuestWaitSeconds          = 0.f;
 				PendingHostReady          = FMOURoomJoinResult();   // 지난 판의 값이 남아 있으면 안 된다
+				TriedCandidateIndex       = INDEX_NONE;
 			}
 
 			// ★ UI 보다 먼저 브로드캐스트하지 않는다. 위젯이 안내 문구를 띄우고
@@ -883,12 +885,13 @@ bool UServerSubsystem::Tick(float DeltaTime)
 		case EServerClientEventType::RoomHostReady:
 		{
 			// 참여자에게만 온다. 이제 붙어도 된다.
-			UE_LOG(LogMOUServer, Log, TEXT("방 #%d 호스트 준비 완료. %s:%d 로 이동한다."),
-				Event.RoomId, *Event.Join.HostAddress, Event.Join.HostPort);
+			UE_LOG(LogMOUServer, Log, TEXT("방 #%d 호스트 준비 완료. 후보 %s 로 이동한다."),
+				Event.RoomId, *Event.Join.ToDisplayString());
 
 			// ★ 브로드캐스트하고 버리지 않는다. 이 순간 로비 위젯이 이미 닫혀 있으면
 			//   예전에는 정보가 통째로 사라져서 참여자가 영영 못 떠났다.
 			PendingHostReady          = Event.Join;
+			TriedCandidateIndex       = INDEX_NONE;
 			bGuestWaitingForHostReady = false;
 			GuestWaitSeconds          = 0.f;
 
@@ -1200,6 +1203,121 @@ void UServerSubsystem::ConfigureTravel(const FString& InHostMapName, bool bInAut
 		bPreloadMapWhileWaiting ? TEXT("O") : TEXT("X"));
 }
 
+namespace
+{
+	/** "192.168.0.32" -> "192.168.0." (마지막 옥텟을 뗀 /24 접두사). 실패하면 빈 문자열. */
+	FString MakeSlash24Prefix(const FString& Ipv4)
+	{
+		int32 LastDot = INDEX_NONE;
+		if (!Ipv4.FindLastChar(TEXT('.'), LastDot) || LastDot <= 0)
+		{
+			return FString();
+		}
+		return Ipv4.Left(LastDot + 1);
+	}
+}
+
+FString UServerSubsystem::GetLocalLanAddress()
+{
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (Sockets == nullptr)
+	{
+		return FString();
+	}
+
+	// GetLocalHostAddr 은 "대표" 주소 하나를 준다. 리슨서버가 실제로 바인드하는
+	// 인터페이스와 같은 값이라, LogListenServerReachability 가 찍는 값과도 일치한다.
+	bool bCanBindAll = false;
+	const TSharedPtr<FInternetAddr> Local = Sockets->GetLocalHostAddr(*GLog, bCanBindAll);
+	if (!Local.IsValid())
+	{
+		return FString();
+	}
+
+	const FString Address = Local->ToString(/*bAppendPort=*/false);
+
+	// 사설 대역이 아니면 신고하지 않는다. 어차피 서버가 걸러내고, 보내봐야
+	// "사설이 아닌 주소를 LAN 후보로 신고했다" 는 거부 로그만 남는다.
+	if (Address.StartsWith(TEXT("127.")) || Address.IsEmpty())
+	{
+		return FString();
+	}
+	return Address;
+}
+
+FMOUHostCandidate UServerSubsystem::ChooseHostCandidate(const TArray<FMOUHostCandidate>& Candidates, int32& OutIndex)
+{
+	OutIndex = INDEX_NONE;
+
+	if (Candidates.Num() == 0)
+	{
+		return FMOUHostCandidate();
+	}
+
+	// 1순위: 나와 같은 /24 안에 있는 LAN 후보.
+	//
+	// ★ Kind 만 보고 고르지 않는다. 다른 사무실의 192.168.0.x 를 신고받을 수도 있고,
+	//   그 주소는 내 LAN 의 엉뚱한 기기를 가리킨다. 내 어댑터와 실제로 비교해야 한다.
+	TArray<FString> MyPrefixes;
+	if (ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
+	{
+		TArray<TSharedPtr<FInternetAddr>> Adapters;
+		if (Sockets->GetLocalAdapterAddresses(Adapters))
+		{
+			for (const TSharedPtr<FInternetAddr>& Adapter : Adapters)
+			{
+				if (Adapter.IsValid() && Adapter->GetProtocolType() == FNetworkProtocolTypes::IPv4)
+				{
+					const FString Prefix = MakeSlash24Prefix(Adapter->ToString(false));
+					if (!Prefix.IsEmpty() && !Prefix.StartsWith(TEXT("127.")))
+					{
+						MyPrefixes.AddUnique(Prefix);
+					}
+				}
+			}
+		}
+	}
+
+	for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+	{
+		const FMOUHostCandidate& C = Candidates[Index];
+		if (C.Kind != EMOUHostAddrKindBP::Lan || !C.IsValid())
+		{
+			continue;
+		}
+		if (MyPrefixes.Contains(MakeSlash24Prefix(C.Address)))
+		{
+			UE_LOG(LogMOUServer, Log,
+				TEXT("[여행] 방장이 나와 같은 LAN 에 있다. %s 로 직접 붙는다(공유기를 거치지 않는다)."),
+				*C.ToDisplayString());
+			OutIndex = Index;
+			return C;
+		}
+	}
+
+	// 2순위: 공인 후보.
+	for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+	{
+		if (Candidates[Index].Kind == EMOUHostAddrKindBP::Public && Candidates[Index].IsValid())
+		{
+			OutIndex = Index;
+			return Candidates[Index];
+		}
+	}
+
+	// 3순위: 남은 아무 것. 여기까지 오는 것은 서버가 예상 밖의 조합을 보낸 경우다.
+	for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+	{
+		if (Candidates[Index].IsValid())
+		{
+			OutIndex = Index;
+			return Candidates[Index];
+		}
+	}
+
+	return FMOUHostCandidate();
+}
+
 void UServerSubsystem::SetRoomPassword(const FString& InRoomPassword)
 {
 	// 빈 값도 받는다 — 공개방으로 바뀌는 것이 정상적인 경우다.
@@ -1255,13 +1373,69 @@ bool UServerSubsystem::TravelToHost()
 		return false;
 	}
 
+	int32 ChosenIndex = INDEX_NONE;
+	const FMOUHostCandidate Chosen = ChooseHostCandidate(PendingHostReady.Candidates, ChosenIndex);
+	if (!Chosen.IsValid())
+	{
+		UE_LOG(LogMOUServer, Error, TEXT("[참여자] 쓸 수 있는 호스트 주소가 없다: %s"),
+			*PendingHostReady.ToDisplayString());
+		OnTravelFailed.Broadcast(TEXT("방장의 접속 주소를 받지 못했습니다."));
+		return false;
+	}
+
+	// 실패하면 다음 후보로 넘어갈 수 있게 어디까지 써봤는지 남긴다.
+	TriedCandidateIndex = ChosenIndex;
+
+	UE_LOG(LogMOUServer, Log, TEXT("[참여자] 후보 %d개 중 %s 선택 (전체: %s)"),
+		PendingHostReady.Candidates.Num(), *Chosen.ToDisplayString(),
+		*PendingHostReady.ToDisplayString());
+
 	// 어디로 떠나는지 남겨둔다. 접속에 실패하면 그 주소를 그대로 넣어
 	// "어디에 못 붙었는지" 를 말해줄 수 있다.
-	NotifyTravelingTo(PendingHostReady.HostAddress, PendingHostReady.HostPort);
+	NotifyTravelingTo(Chosen.Address, Chosen.Port);
 
 	// MakeTravelURL 이 "IP:포트?RoomPassword=1234" 를 만들어준다.
-	PC->ClientTravel(PendingHostReady.MakeTravelURL(TravelRoomPassword), ETravelType::TRAVEL_Absolute);
+	PC->ClientTravel(Chosen.MakeTravelURL(TravelRoomPassword), ETravelType::TRAVEL_Absolute);
 	return true;
+}
+
+bool UServerSubsystem::TryNextHostCandidate()
+{
+	if (!PendingHostReady.bSuccess || PendingHostReady.Candidates.Num() <= 1)
+	{
+		return false;
+	}
+
+	// 이미 써본 것 다음부터, 유효한 후보를 하나 찾는다.
+	for (int32 Index = TriedCandidateIndex + 1; Index < PendingHostReady.Candidates.Num(); ++Index)
+	{
+		const FMOUHostCandidate& Next = PendingHostReady.Candidates[Index];
+		if (!Next.IsValid())
+		{
+			continue;
+		}
+
+		UGameInstance* GI = GetGameInstance();
+		APlayerController* PC = GI ? GI->GetFirstLocalPlayerController() : nullptr;
+		if (PC == nullptr)
+		{
+			return false;
+		}
+
+		TriedCandidateIndex = Index;
+
+		// ★ 이 폴백이 없으면 후보 선택이 한 번 빗나갈 때마다 접속이 통째로 실패한다.
+		//   /24 판정은 넷마스크를 모르고 하는 추측이라 빗나갈 수 있다. 빗나가도
+		//   결과가 "예전과 같음" 에 머물게 하는 것이 이 함수의 존재 이유다.
+		UE_LOG(LogMOUServer, Log, TEXT("[참여자] 다음 후보로 다시 시도한다: %s"),
+			*Next.ToDisplayString());
+
+		NotifyTravelingTo(Next.Address, Next.Port);
+		PC->ClientTravel(Next.MakeTravelURL(TravelRoomPassword), ETravelType::TRAVEL_Absolute);
+		return true;
+	}
+
+	return false;
 }
 
 // ---------------------------------------------------------------------------
@@ -1383,8 +1557,17 @@ void UServerSubsystem::HandleNetworkFailure(UWorld* /*World*/, UNetDriver* /*Net
 	UE_LOG(LogMOUServer, Error, TEXT("[접속 실패] %s (엔진 사유: %d / %s)"),
 		*Reason, static_cast<int32>(FailureType), *ErrorString);
 
-	OnTravelFailed.Broadcast(Reason);
 	PendingTravelAddress.Reset();
+
+	// ★ 사용자에게 실패를 알리기 전에 남은 후보를 먼저 써본다. (v8)
+	//   LAN 후보를 골랐는데 그 판단이 빗나갔다면, 공인 후보로 가면 될 일이다.
+	//   여기서 바로 포기하면 후보 목록을 만든 의미가 없다.
+	if (TryNextHostCandidate())
+	{
+		return;
+	}
+
+	OnTravelFailed.Broadcast(Reason);
 }
 
 void UServerSubsystem::HandleTravelFailure(UWorld* /*World*/,

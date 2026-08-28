@@ -234,7 +234,8 @@ public:
 
 	// --- 로비 ------------------------------------------------------------
 
-	virtual void CreateRoom(const FString& Title, const FString& RoomPassword, int32 HostPort) = 0;
+	virtual void CreateRoom(const FString& Title, const FString& RoomPassword, int32 HostPort,
+	                        const FString& LanAddress) = 0;
 	virtual void RequestRoomList() = 0;
 	virtual void JoinRoom(int32 RoomId, const FString& RoomPassword) = 0;
 	virtual void LeaveRoom() = 0;

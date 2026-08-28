@@ -69,7 +69,7 @@ void FEOSLobbyBackend::SendSetDead(int64, bool)
 	LogNotImplemented(TEXT("생사 상태 (자체 서버가 계속 담당한다)"));
 }
 
-void FEOSLobbyBackend::CreateRoom(const FString&, const FString&, int32)
+void FEOSLobbyBackend::CreateRoom(const FString&, const FString&, int32, const FString&)
 {
 	LogNotImplemented(TEXT("방 생성 (CreateSession)"));
 }

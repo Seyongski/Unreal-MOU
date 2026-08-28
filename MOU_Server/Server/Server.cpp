@@ -94,6 +94,98 @@ namespace
 		return GPublicIp;
 	}
 
+	/** HostCandidate 하나를 채운다. 주소가 비었거나 너무 길면 아무것도 하지 않고 false. */
+	bool PushCandidate(std::vector<HostCandidate>& Out, const std::string& Address,
+	                   uint16_t Port, EHostAddrKind Kind)
+	{
+		if (Address.empty() || Address.size() >= kMaxAddressLen || Port == 0)
+		{
+			return false;
+		}
+		if (Out.size() >= kMaxHostCandidates)
+		{
+			return false;
+		}
+		// 같은 주소가 두 번 들어가는 것을 막는다. 방장이 서버와 같은 LAN 이면
+		// 공인 후보와 사설 후보가 같은 값이 될 수 있다.
+		for (const HostCandidate& C : Out)
+		{
+			if (Address == C.Address && Port == C.Port)
+			{
+				return false;
+			}
+		}
+
+		HostCandidate C{};
+		CopyFixedString(C.Address, kMaxAddressLen, Address);
+		C.Port = Port;
+		C.Kind = static_cast<uint8_t>(Kind);
+		Out.push_back(C);
+		return true;
+	}
+
+	/**
+	 * 방에 기록할 호스트 주소 후보들을 만든다. (v8)
+	 *
+	 * [왜 하나가 아니라 목록인가]
+	 *   v7 까지는 공인 주소 하나만 내려줬다. 그러면 **방장과 같은 공유기 안에 있는
+	 *   참가자**까지 공인 IP 로 나갔다 돌아오는 헤어핀 접속을 해야 한다.
+	 *   헤어핀을 지원하지 않는 공유기가 흔해서, 바로 옆자리 사람이 못 들어왔다.
+	 *   실측으로 확인한 문제다 — 같은 LAN 에서 사설 IP 로는 즉시 붙는데
+	 *   공인 IP 로는 핸드셰이크가 통째로 사라졌다.
+	 *
+	 * [무엇을 믿는가]
+	 *   1) 공인 후보 — accept() 에서 읽은 값. 클라이언트가 못 건드린다
+	 *   2) 사설 후보 — 클라이언트 신고값. **사설 대역일 때만** 받는다
+	 *
+	 *   2번을 그냥 믿으면 남의 공인 주소를 적어 접속을 몰아주는 장난이 가능하다.
+	 *   사설 대역으로 제한하면 최악이 "같은 LAN 안의 엉뚱한 기기" 까지고,
+	 *   받는 쪽도 자기 서브넷과 맞을 때만 그 후보를 쓴다.
+	 *
+	 * 순서가 곧 우선순위는 아니다 — 고르는 것은 받는 쪽이다.
+	 */
+	std::vector<HostCandidate> BuildHostCandidates(const std::string& PeerAddress,
+	                                               const std::string& ReportedLanAddress,
+	                                               uint16_t HostPort)
+	{
+		std::vector<HostCandidate> Candidates;
+
+		PushCandidate(Candidates, ResolveHostAddress(PeerAddress), HostPort, EHostAddrKind::Public);
+
+		if (!ReportedLanAddress.empty())
+		{
+			if (IsPrivateAddress(ReportedLanAddress))
+			{
+				PushCandidate(Candidates, ReportedLanAddress, HostPort, EHostAddrKind::Lan);
+			}
+			else
+			{
+				// 조용히 버리지 않고 남긴다. 공인 주소를 사설 자리에 넣어 보내는 것은
+				// 버그이거나 장난이고, 둘 다 알아야 한다.
+				std::printf("[거부] 사설이 아닌 주소를 LAN 후보로 신고했다: %s\n",
+				            ReportedLanAddress.c_str());
+			}
+		}
+
+		return Candidates;
+	}
+
+	/** 방의 후보 목록을 패킷 배열에 옮긴다. 반환값은 실제로 채운 개수. */
+	uint8_t FillCandidates(HostCandidate (&Dest)[kMaxHostCandidates],
+	                       const std::vector<HostCandidate>& Src)
+	{
+		uint8_t Count = 0;
+		for (const HostCandidate& C : Src)
+		{
+			if (Count >= kMaxHostCandidates)
+			{
+				break;
+			}
+			Dest[Count++] = C;
+		}
+		return Count;
+	}
+
 	// Ctrl+C 로 서버를 내릴 때 큐에 남은 채팅 로그를 마저 쓰고 나간다.
 	// 이게 없으면 accept() 에서 블록된 채 프로세스가 즉사해서
 	// 아직 커밋 안 된 로그가 통째로 사라진다.
@@ -745,22 +837,28 @@ namespace
 		// 비밀번호는 널 종료가 없는 고정 4바이트다. 길이를 지정해 그대로 읽는다.
 		const std::string Password(Req.Password, kRoomPasswordLen);
 
-		// PeerAddress 를 그대로 쓰지 않고 한 번 거른다. 호스트가 서버와 같은
-		// 공유기 안이면 사설 IP 라서, 외부 참가자가 그 주소로는 못 온다.
-		const std::string HostAddress = ResolveHostAddress(Session->PeerAddress);
+		// 공인 주소는 서버가 관측하고, 사설 주소는 호스트가 신고한 값을 검사해서 받는다.
+		// 판단은 전부 BuildHostCandidates 안에 있다.
+		const std::string ReportedLan = ReadFixedString(Req.LanAddress, kMaxAddressLen);
+		const std::vector<HostCandidate> Candidates =
+			BuildHostCandidates(Session->PeerAddress, ReportedLan, Req.HostPort);
 
 		uint32_t NewRoomId = 0;
 		const ERoomResult R = Rooms::Create(
-			Session->UserId, Session->Name, HostAddress, Req.HostPort,
+			Session->UserId, Session->Name, Candidates,
 			Title, Req.bHasPassword != 0, Password, Req.MaxPlayers, NewRoomId);
 
 		if (R == ERoomResult::Success)
 		{
-			std::printf("[방 생성] #%u \"%s\" 방장=%s(%llu) 주소=%s:%u %s\n",
+			std::printf("[방 생성] #%u \"%s\" 방장=%s(%llu) %s\n",
 			            NewRoomId, Title.c_str(), Session->Name.c_str(),
 			            static_cast<unsigned long long>(Session->UserId),
-			            HostAddress.c_str(), Req.HostPort,
 			            Req.bHasPassword ? "[비번]" : "");
+			for (const HostCandidate& C : Candidates)
+			{
+				std::printf("[방 생성]   후보 %s:%u (%s)\n", C.Address, C.Port,
+				            C.Kind == static_cast<uint8_t>(EHostAddrKind::Lan) ? "LAN" : "공인");
+			}
 		}
 		else
 		{
@@ -826,20 +924,18 @@ namespace
 
 		const std::string Password(Req.Password, kRoomPasswordLen);
 
-		std::string HostAddress;
-		uint16_t    HostPort = 0;
+		std::vector<HostCandidate> Candidates;
 		const ERoomResult R = Rooms::Join(Req.RoomId, Session->UserId, Session->Name,
-		                                  Password, HostAddress, HostPort);
+		                                  Password, Candidates);
 
 		Ack.RoomId = Req.RoomId;
 		if (R == ERoomResult::Success)
 		{
-			CopyFixedString(Ack.HostAddress, kMaxAddressLen, HostAddress);
-			Ack.HostPort = HostPort;
-			std::printf("[방 참여] #%u <- %s(%llu), 주소 %s:%u 전달\n",
+			Ack.CandidateCount = FillCandidates(Ack.Candidates, Candidates);
+			std::printf("[방 참여] #%u <- %s(%llu), 주소 후보 %u개 전달\n",
 			            Req.RoomId, Session->Name.c_str(),
 			            static_cast<unsigned long long>(Session->UserId),
-			            HostAddress.c_str(), HostPort);
+			            static_cast<unsigned>(Ack.CandidateCount));
 		}
 		else
 		{
@@ -927,12 +1023,11 @@ namespace
 		}
 
 		uint32_t    RoomId = 0;
-		std::string HostAddress;
-		uint16_t    HostPort = 0;
+		std::vector<HostCandidate> Candidates;
 		std::vector<uint64_t> Recipients;
 
 		const ERoomResult R = Rooms::StartGame(Session->UserId, RoomId,
-		                                       HostAddress, HostPort, Recipients);
+		                                       Candidates, Recipients);
 		if (R != ERoomResult::Success)
 		{
 			std::printf("[거부] 게임 시작 실패: %s(%llu) (사유 %u)\n", Session->Name.c_str(),
@@ -940,13 +1035,12 @@ namespace
 			return true;
 		}
 
-		std::printf("[게임 시작] #%u 방장=%s, 호스트 %s:%u, 인원 %zu명\n",
-		            RoomId, Session->Name.c_str(), HostAddress.c_str(), HostPort, Recipients.size());
+		std::printf("[게임 시작] #%u 방장=%s, 주소 후보 %zu개, 인원 %zu명\n",
+		            RoomId, Session->Name.c_str(), Candidates.size(), Recipients.size());
 
 		RoomStartBody Start{};
-		Start.RoomId   = RoomId;
-		Start.HostPort = HostPort;
-		CopyFixedString(Start.HostAddress, kMaxAddressLen, HostAddress);
+		Start.RoomId         = RoomId;
+		Start.CandidateCount = FillCandidates(Start.Candidates, Candidates);
 
 		SendToUsers(Recipients, EOpcode::RoomStart, &Start, sizeof(Start), nullptr, 0);
 
@@ -977,12 +1071,11 @@ namespace
 		}
 
 		uint32_t    RoomId = 0;
-		std::string HostAddress;
-		uint16_t    HostPort = 0;
+		std::vector<HostCandidate> Candidates;
 		std::vector<uint64_t> Recipients;
 
 		const ERoomResult R = Rooms::MarkHostReady(Session->UserId, RoomId,
-		                                           HostAddress, HostPort, Recipients);
+		                                           Candidates, Recipients);
 		if (R != ERoomResult::Success)
 		{
 			std::printf("[거부] 호스트 준비 신고 실패: %s(%llu) (사유 %u)\n", Session->Name.c_str(),
@@ -990,13 +1083,12 @@ namespace
 			return true;
 		}
 
-		std::printf("[호스트 준비] #%u 리슨서버 %s:%u 가 열렸다. 참여자 %zu명에게 출발 신호\n",
-		            RoomId, HostAddress.c_str(), HostPort, Recipients.size());
+		std::printf("[호스트 준비] #%u 리슨서버가 열렸다. 참여자 %zu명에게 출발 신호 (주소 후보 %zu개)\n",
+		            RoomId, Recipients.size(), Candidates.size());
 
 		RoomHostReadyBody Ready{};
-		Ready.RoomId   = RoomId;
-		Ready.HostPort = HostPort;
-		CopyFixedString(Ready.HostAddress, kMaxAddressLen, HostAddress);
+		Ready.RoomId         = RoomId;
+		Ready.CandidateCount = FillCandidates(Ready.Candidates, Candidates);
 
 		SendToUsers(Recipients, EOpcode::RoomHostReady, &Ready, sizeof(Ready), nullptr, 0);
 		return true;

@@ -628,8 +628,8 @@ void ULobbyWidgetBase::HandleHostReady(const FMOURoomJoinResult& Host)
 	//   그 조건 때문에, 게임 시작과 함께 화면이 바뀌어 UIState 가 달라진 참여자는
 	//   출발 신호를 받고도 조용히 무시했다. 이제 떠나는 일은 서브시스템이 하므로
 	//   이 함수가 무엇을 하든 이동은 보장된다. 여기서는 안내만 한다.
-	SetMessage(FString::Printf(TEXT("호스트 %s:%d 로 이동합니다..."),
-		*Host.HostAddress, Host.HostPort), false);
+	SetMessage(FString::Printf(TEXT("호스트 %s 로 이동합니다..."),
+		*Host.ToDisplayString()), false);
 
 	OnHostReady(Host, JoinedRoomPassword);
 

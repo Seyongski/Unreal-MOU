@@ -27,7 +27,14 @@ namespace MOU
 	//            ★ EChatChannel::Dead 와 SetDead 가 **폐기**됐다. 죽은 사람 채팅은
 	//              이 서버가 아니라 방장의 리슨서버가 처리한다 —
 	//              CHAT_DESIGN.md 3절. 번호는 호환을 위해 남겨두되 쓰지 않는다.
-	constexpr uint16_t kProtocolVersion = 7;
+	//   7 -> 8 : 호스트 주소가 **하나에서 후보 목록으로** 바뀌었다.
+	//            방 주소를 서버가 관측한 공인 IP 하나로만 내려주다 보니, 방장과 같은
+	//            공유기 안에 있는 참가자까지 공인 IP 로 나갔다 돌아오는 헤어핀 접속을
+	//            해야 했다. 헤어핀을 지원하지 않는 공유기가 흔해서 그 조합이 통째로
+	//            막혔다 — 바로 옆자리 사람이 못 들어오는데 원인이 안 보였다.
+	//            이제 공인 주소와 사설(LAN) 주소를 같이 내려주고, 받는 쪽이 자기
+	//            네트워크에 맞는 것을 고른다. 실패하면 다음 후보로 넘어간다.
+	constexpr uint16_t kProtocolVersion = 8;
 
 	// BodySize 가 이 값을 넘으면 악성 패킷으로 보고 연결을 끊는다.
 	constexpr uint32_t kMaxBodySize = 4096;
@@ -74,6 +81,38 @@ namespace MOU
 	constexpr uint32_t kMaxPlayersInRoom = 4;    // 1~4인 게임
 	constexpr uint32_t kMaxRoomsInList   = 20;   // 한 번에 내려주는 방 개수 상한
 	constexpr uint32_t kMaxAddressLen    = 16;   // "255.255.255.255" + 널
+
+	/**
+	 * 한 방이 내려줄 수 있는 호스트 주소 후보의 최대 개수. (v8)
+	 *
+	 * 지금 쓰는 것은 둘이다 — 공인 1개, 사설(LAN) 1개.
+	 * 셋째 자리는 릴레이 주소를 위해 비워둔다.
+	 */
+	constexpr uint32_t kMaxHostCandidates = 3;
+
+	/**
+	 * 이 주소가 어떤 성격인가. 받는 쪽이 "나에게 맞는 것" 을 고르는 기준이다.
+	 *
+	 * ★ 이 값을 신뢰의 근거로 쓰면 안 된다. Kind 는 힌트일 뿐이고,
+	 *   Lan 후보를 쓸지는 받는 쪽이 **자기 서브넷과 비교해서** 정한다.
+	 *   서버도 Lan 후보가 진짜 사설 대역인지 검사한 뒤에만 기록한다 —
+	 *   그러지 않으면 남의 공인 주소를 적어 접속을 몰아주는 장난이 가능하다.
+	 */
+	enum class EHostAddrKind : uint8_t
+	{
+		Public = 0,   // 서버가 TCP 피어에서 관측했다. 위조 불가
+		Lan    = 1,   // 호스트가 신고한 사설 주소. 같은 공유기 안의 참가자 전용
+		Relay  = 2,   // (예약) 서버 중계 주소
+	};
+
+	/** 호스트에게 가는 길 하나. */
+	struct HostCandidate
+	{
+		char     Address[kMaxAddressLen];
+		uint16_t Port;
+		uint8_t  Kind;                         // EHostAddrKind
+		uint8_t  Reserved;                     // 패딩을 눈에 보이게 둔다
+	};
 
 	enum class EOpcode : uint16_t
 	{
@@ -352,6 +391,23 @@ namespace MOU
 	{
 		char     Title[kMaxRoomTitleLen];
 		char     Password[kRoomPasswordLen];   // bHasPassword 가 0 이면 무시한다
+
+		/**
+		 * 호스트의 LAN IP. (v8)
+		 *
+		 * [위 주석과 모순되는 것 아닌가]
+		 *   아니다. 공인 주소는 여전히 클라이언트에게 묻지 않는다 — 그것은 서버가
+		 *   accept() 에서 읽는다. 여기서 받는 것은 **사설 주소뿐**이고, 서버가
+		 *   사설 대역인지 검사해서 아니면 버린다.
+		 *
+		 *   그래서 최악의 경우에도 "같은 LAN 안의 엉뚱한 기기로 접속을 유도" 까지가
+		 *   한계다. 남을 임의의 공인 주소로 몰아보낼 수는 없다. 게다가 받는 쪽도
+		 *   자기 서브넷과 맞을 때만 이 후보를 쓴다.
+		 *
+		 * 비워 보내도 된다(사설 IP 를 못 알아낸 경우). 그러면 공인 후보만 남는다.
+		 */
+		char     LanAddress[kMaxAddressLen];
+
 		uint16_t HostPort;                     // 리슨서버 포트 (보통 7777)
 		uint8_t  bHasPassword;
 		uint8_t  MaxPlayers;                   // 1~kMaxPlayersInRoom
@@ -394,11 +450,12 @@ namespace MOU
 
 	struct RoomJoinAckBody
 	{
-		uint32_t RoomId;
-		char     HostAddress[kMaxAddressLen];  // 성공했을 때만 채워진다
-		uint16_t HostPort;
-		uint8_t  bSuccess;
-		uint8_t  Result;                       // ERoomResult
+		uint32_t      RoomId;
+		HostCandidate Candidates[kMaxHostCandidates];   // 성공했을 때만 채워진다
+		uint8_t       CandidateCount;
+		uint8_t       bSuccess;
+		uint8_t       Result;                           // ERoomResult
+		uint8_t       Reserved;
 	};
 
 	// 호스트가 진행 상태를 알린다. 방장만 보낼 수 있다.
@@ -458,9 +515,10 @@ namespace MOU
 	//   무엇보다 "지금 떠나도 된다" 는 신호가 주소와 함께 오는 편이 명확하다.
 	struct RoomStartBody
 	{
-		uint32_t RoomId;
-		char     HostAddress[kMaxAddressLen];
-		uint16_t HostPort;
+		uint32_t      RoomId;
+		HostCandidate Candidates[kMaxHostCandidates];
+		uint8_t       CandidateCount;
+		uint8_t       Reserved[3];
 	};
 
 	/**
@@ -479,9 +537,10 @@ namespace MOU
 	 */
 	struct RoomHostReadyBody
 	{
-		uint32_t RoomId;
-		char     HostAddress[kMaxAddressLen];
-		uint16_t HostPort;
+		uint32_t      RoomId;
+		HostCandidate Candidates[kMaxHostCandidates];
+		uint8_t       CandidateCount;
+		uint8_t       Reserved[3];
 	};
 
 	// ------------------------------------------------------------------
@@ -654,19 +713,20 @@ namespace MOU
 	static_assert(sizeof(ChatSendBody)      == 11, "ChatSendBody 에 패딩이 끼었다");
 	static_assert(sizeof(ChatBroadcastBody) == 51, "ChatBroadcastBody 에 패딩이 끼었다");
 	static_assert(sizeof(SetDeadBody)       ==  9, "SetDeadBody 에 패딩이 끼었다");
-	static_assert(sizeof(RoomCreateReqBody) == 56, "RoomCreateReqBody 에 패딩이 끼었다");
+	static_assert(sizeof(HostCandidate)      == 20, "HostCandidate 에 패딩이 끼었다");
+	static_assert(sizeof(RoomCreateReqBody) == 72, "RoomCreateReqBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomCreateAckBody) ==  6, "RoomCreateAckBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomInfo)          == 96, "RoomInfo 에 패딩이 끼었다");
 	static_assert(sizeof(RoomListAckBody)   ==  2, "RoomListAckBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomJoinReqBody)   ==  8, "RoomJoinReqBody 에 패딩이 끼었다");
-	static_assert(sizeof(RoomJoinAckBody)   == 24, "RoomJoinAckBody 에 패딩이 끼었다");
+	static_assert(sizeof(RoomJoinAckBody)   == 68, "RoomJoinAckBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomStateUpdateBody) == 6, "RoomStateUpdateBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomMemberInfo)     == 42, "RoomMemberInfo 에 패딩이 끼었다");
 	static_assert(sizeof(RoomMemberListBody) ==  6, "RoomMemberListBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomReadyReqBody)   ==  1, "RoomReadyReqBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomClosedBody)     ==  5, "RoomClosedBody 에 패딩이 끼었다");
-	static_assert(sizeof(RoomStartBody)      == 22, "RoomStartBody 에 패딩이 끼었다");
-	static_assert(sizeof(RoomHostReadyBody)  == 22, "RoomHostReadyBody 에 패딩이 끼었다");
+	static_assert(sizeof(RoomStartBody)      == 68, "RoomStartBody 에 패딩이 끼었다");
+	static_assert(sizeof(RoomHostReadyBody)  == 68, "RoomHostReadyBody 에 패딩이 끼었다");
 
 	// 방 목록 한 번에 담을 수 있는지 확인한다. 넘치면 kMaxRoomsInList 를 줄여야 한다.
 	static_assert(sizeof(RoomListAckBody) + sizeof(RoomInfo) * kMaxRoomsInList <= kMaxBodySize,

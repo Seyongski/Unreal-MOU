@@ -410,9 +410,8 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.Type             = EServerClientEventType::RoomJoinAck;
 		Event.Join.bSuccess    = (Ack.bSuccess != 0);
 		Event.Join.RoomId      = static_cast<int32>(Ack.RoomId);
-		Event.Join.HostPort    = static_cast<int32>(Ack.HostPort);
 		Event.Join.Result      = static_cast<EMOURoomResultBP>(Ack.Result);
-		Event.Join.HostAddress = MOUChat::ReadFixedString(Ack.HostAddress, static_cast<int32>(MOU::kMaxAddressLen));
+		MOUChat::ReadHostCandidates(Ack.Candidates, Ack.CandidateCount, Event.Join.Candidates);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}
@@ -501,8 +500,7 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.RoomId           = static_cast<int32>(Start.RoomId);
 		Event.Join.bSuccess    = true;
 		Event.Join.RoomId      = static_cast<int32>(Start.RoomId);
-		Event.Join.HostPort    = static_cast<int32>(Start.HostPort);
-		Event.Join.HostAddress = MOUChat::ReadFixedString(Start.HostAddress, static_cast<int32>(MOU::kMaxAddressLen));
+		MOUChat::ReadHostCandidates(Start.Candidates, Start.CandidateCount, Event.Join.Candidates);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}
@@ -524,8 +522,7 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.RoomId           = static_cast<int32>(Ready.RoomId);
 		Event.Join.bSuccess    = true;
 		Event.Join.RoomId      = static_cast<int32>(Ready.RoomId);
-		Event.Join.HostPort    = static_cast<int32>(Ready.HostPort);
-		Event.Join.HostAddress = MOUChat::ReadFixedString(Ready.HostAddress, static_cast<int32>(MOU::kMaxAddressLen));
+		MOUChat::ReadHostCandidates(Ready.Candidates, Ready.CandidateCount, Event.Join.Candidates);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}

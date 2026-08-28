@@ -53,11 +53,14 @@ namespace MOU
 		 *
 		 * @param HostUserId  방장의 계정 번호
 		 * @param HostName    방장 닉네임 (목록 표시용)
-		 * @param HostAddress 서버가 TCP 연결에서 읽은 방장의 IP. 클라이언트 신고값이 아니다
+		 * @param Candidates  호스트에게 가는 길들. (v8)
+		 *                    공인 주소는 서버가 TCP 연결에서 읽은 값이고, 사설 주소는
+		 *                    호스트가 신고했지만 서버가 사설 대역인지 검사한 뒤에만 들어온다.
+		 *                    만드는 곳은 Server.cpp 의 BuildHostCandidates 하나뿐이다.
 		 * @param OutRoomId   성공 시 새 방 번호
 		 */
 		ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
-		                   const std::string& HostAddress, uint16_t HostPort,
+		                   const std::vector<HostCandidate>& Candidates,
 		                   const std::string& Title, bool bHasPassword,
 		                   const std::string& Password, uint8_t MaxPlayers,
 		                   uint32_t& OutRoomId);
@@ -74,7 +77,7 @@ namespace MOU
 		 */
 		ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
 		                 const std::string& Password,
-		                 std::string& OutHostAddress, uint16_t& OutHostPort);
+		                 std::vector<HostCandidate>& OutCandidates);
 
 		/**
 		 * 방에서 나간다. 방장이 나가면 방이 통째로 사라진다.
@@ -106,7 +109,7 @@ namespace MOU
 		 * @param OutNotifyUserIds 시작을 알려야 할 멤버 전원 (방장 포함)
 		 */
 		ERoomResult StartGame(uint64_t HostUserId, uint32_t& OutRoomId,
-		                      std::string& OutHostAddress, uint16_t& OutHostPort,
+		                      std::vector<HostCandidate>& OutCandidates,
 		                      std::vector<uint64_t>& OutNotifyUserIds);
 
 		/**
@@ -124,7 +127,7 @@ namespace MOU
 		 *         NotStarted 아직 StartGame 을 거치지 않은 방이다
 		 */
 		ERoomResult MarkHostReady(uint64_t HostUserId, uint32_t& OutRoomId,
-		                          std::string& OutHostAddress, uint16_t& OutHostPort,
+		                          std::vector<HostCandidate>& OutCandidates,
 		                          std::vector<uint64_t>& OutNotifyUserIds);
 
 		/**

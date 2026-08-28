@@ -50,7 +50,8 @@ public:
 	virtual void SendChat(EChatChannelBP Channel, const FString& Text) override;
 	virtual void SendSetDead(int64 UserId, bool bDead) override;
 
-	virtual void CreateRoom(const FString& Title, const FString& RoomPassword, int32 HostPort) override;
+	virtual void CreateRoom(const FString& Title, const FString& RoomPassword, int32 HostPort,
+	                        const FString& LanAddress) override;
 	virtual void RequestRoomList() override;
 	virtual void JoinRoom(int32 RoomId, const FString& RoomPassword) override;
 	virtual void LeaveRoom() override;

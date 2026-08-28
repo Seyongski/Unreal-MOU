@@ -371,6 +371,42 @@ public:
 	bool HasPendingHostReady() const { return PendingHostReady.bSuccess; }
 
 	/**
+	 * 이 PC 의 LAN IPv4. 방을 만들 때 사설 후보로 신고한다. (v8)
+	 * 못 찾으면 빈 문자열 — 그러면 공인 후보만 남고 v7 과 같이 동작한다.
+	 */
+	UFUNCTION(BlueprintPure, Category = "MOU|Lobby")
+	static FString GetLocalLanAddress();
+
+	/**
+	 * 후보들 중 **내 네트워크에 맞는 것**을 고른다. (v8)
+	 *
+	 * [규칙]
+	 *   1) Lan 후보가 있고 그 주소가 내 어댑터 중 하나와 같은 /24 안이면 그것
+	 *   2) 아니면 Public 후보
+	 *   3) 둘 다 없으면 남은 아무 것
+	 *
+	 * [왜 /24 인가]
+	 *   넷마스크를 정확히 알아내는 경로가 플랫폼마다 다르고, 틀렸을 때의 손해가
+	 *   이득보다 크다. /24 는 가정용·사무실 공유기의 절대다수를 덮고,
+	 *   빗나가도 접속 실패 시 다음 후보로 넘어가므로 최악이 "예전과 같음" 이다.
+	 *
+	 * @param OutIndex 고른 후보의 인덱스. 실패 시 INDEX_NONE
+	 * @return 고른 후보. 유효하지 않으면 후보가 하나도 쓸만하지 않다는 뜻이다
+	 */
+	static FMOUHostCandidate ChooseHostCandidate(const TArray<FMOUHostCandidate>& Candidates, int32& OutIndex);
+
+	/**
+	 * 마지막에 쓴 후보가 실패했을 때 다음 후보로 다시 붙어본다. (v8)
+	 *
+	 * ★ 이것이 후보 선택을 안전하게 만든다.
+	 *   /24 비교는 넷마스크를 모르고 하는 추측이라 빗나갈 수 있다. 폴백이 있으면
+	 *   빗나갔을 때 최악이 "예전과 같음(공인으로 시도)" 이고, 없으면 "예전보다 나쁨" 이다.
+	 *
+	 * @return 다시 시도했으면 true. 남은 후보가 없으면 false — 그때가 진짜 실패다
+	 */
+	bool TryNextHostCandidate();
+
+	/**
 	 * 지금 쓰고 있는 백엔드 이름. "자체 서버(TCP)" / "EOS".
 	 * 디버그 화면에 띄워두면 "어디에 붙어 있는지" 를 묻지 않아도 된다.
 	 */
@@ -730,6 +766,9 @@ private:
 	 * 없었어도, 나중에 만들어진 위젯이 HasPendingHostReady 로 상태를 복원할 수 있다.
 	 */
 	FMOURoomJoinResult PendingHostReady;
+
+	/** PendingHostReady.Candidates 중 마지막으로 시도한 인덱스. 폴백이 여기서 이어간다. */
+	int32 TriedCandidateIndex = INDEX_NONE;
 
 	/**
 	 * 참여자가 RoomStart 를 받고 나서 흐른 시간. 출발 신호를 기다리는 중에만 센다.

@@ -216,7 +216,8 @@ void FSocketLobbyBackend::SendSetDead(int64 UserId, bool bDead)
 // 실제 게임 트래픽은 참가자가 호스트의 리슨서버에 직접 붙어서 주고받는다.
 // ---------------------------------------------------------------------------
 
-void FSocketLobbyBackend::CreateRoom(const FString& Title, const FString& RoomPassword, int32 HostPort)
+void FSocketLobbyBackend::CreateRoom(const FString& Title, const FString& RoomPassword, int32 HostPort,
+                                     const FString& LanAddress)
 {
 	if (ServerClient == nullptr)
 	{
@@ -227,6 +228,12 @@ void FSocketLobbyBackend::CreateRoom(const FString& Title, const FString& RoomPa
 	MOUChat::CopyFixedString(Request.Title, static_cast<int32>(MOU::kMaxRoomTitleLen), Title);
 	Request.HostPort   = static_cast<uint16>(HostPort);
 	Request.MaxPlayers = static_cast<uint8>(MOU::kMaxPlayersInRoom);
+
+	// ★ 사설 주소만 보낸다. 공인 주소는 여전히 서버가 accept() 에서 읽는다 — (v8)
+	//   클라이언트가 공인 주소를 신고하게 두면 남의 주소를 적어 접속을 몰아줄 수 있다.
+	//   서버도 이 값이 사설 대역인지 다시 검사하고, 아니면 버린다.
+	//   비워 보내도 된다. 그러면 공인 후보만 남고 예전(v7)과 같이 동작한다.
+	MOUChat::CopyFixedString(Request.LanAddress, static_cast<int32>(MOU::kMaxAddressLen), LanAddress);
 
 	const bool bUsePassword = (RoomPassword.Len() == static_cast<int32>(MOU::kRoomPasswordLen));
 	Request.bHasPassword = bUsePassword ? 1 : 0;
@@ -241,8 +248,10 @@ void FSocketLobbyBackend::CreateRoom(const FString& Title, const FString& RoomPa
 	if (MOUChat::BuildPacket(Packet, MOU::EOpcode::RoomCreateReq, &Request, sizeof(Request)))
 	{
 		ServerClient->EnqueuePacket(MoveTemp(Packet));
-		UE_LOG(LogMOUServer, Log, TEXT("RoomCreateReq 전송: \"%s\" 포트 %d %s"),
-			*Title, HostPort, bUsePassword ? TEXT("[비번]") : TEXT(""));
+		UE_LOG(LogMOUServer, Log, TEXT("RoomCreateReq 전송: \"%s\" 포트 %d, LAN 주소 %s %s"),
+			*Title, HostPort,
+			LanAddress.IsEmpty() ? TEXT("(없음)") : *LanAddress,
+			bUsePassword ? TEXT("[비번]") : TEXT(""));
 	}
 }
 

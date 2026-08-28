@@ -25,8 +25,8 @@ namespace
 		uint32_t    RoomId = 0;
 		uint64_t    HostUserId = 0;
 		std::string HostName;
-		std::string HostAddress;    // 서버가 TCP 피어에서 읽은 값
-		uint16_t    HostPort = 0;
+		std::vector<HostCandidate> Candidates;   // 호스트에게 가는 길들 (v8). Server.cpp 가 만든다
+
 		std::string Title;
 		bool        bHasPassword = false;
 		std::string Password;       // 숫자 4자리. 방과 함께 사라지는 휘발성 값이다
@@ -107,12 +107,12 @@ namespace
 }
 
 ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
-                   const std::string& HostAddress, uint16_t HostPort,
+                   const std::vector<HostCandidate>& Candidates,
                    const std::string& Title, bool bHasPassword,
                    const std::string& Password, uint8_t MaxPlayers,
                    uint32_t& OutRoomId)
 {
-	if (HostPort == 0 || Title.empty())
+	if (Candidates.empty() || Title.empty())
 	{
 		return ERoomResult::InvalidRequest;
 	}
@@ -138,8 +138,8 @@ ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
 	NewRoom.RoomId       = GNextRoomId++;
 	NewRoom.HostUserId   = HostUserId;
 	NewRoom.HostName     = HostName;
-	NewRoom.HostAddress  = HostAddress;
-	NewRoom.HostPort     = HostPort;
+	NewRoom.Candidates   = Candidates;
+
 	NewRoom.Title        = Title;
 	NewRoom.bHasPassword = bHasPassword;
 	NewRoom.Password     = bHasPassword ? Password : std::string();
@@ -160,7 +160,7 @@ ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
 
 ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
                  const std::string& Password,
-                 std::string& OutHostAddress, uint16_t& OutHostPort)
+                 std::vector<HostCandidate>& OutCandidates)
 {
 	std::lock_guard<std::mutex> Lock(GMutex);
 
@@ -187,8 +187,7 @@ ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
 	{
 		if (M.UserId == UserId)
 		{
-			OutHostAddress = R.HostAddress;
-			OutHostPort    = R.HostPort;
+			OutCandidates = R.Candidates;
 			return ERoomResult::Success;
 		}
 	}
@@ -210,8 +209,8 @@ ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
 	NewMember.bReady = false;   // 들어오면 준비 안 된 상태로 시작한다
 	R.Members.push_back(std::move(NewMember));
 
-	OutHostAddress = R.HostAddress;
-	OutHostPort    = R.HostPort;
+	OutCandidates = R.Candidates;
+
 	return ERoomResult::Success;
 }
 
@@ -282,7 +281,7 @@ ERoomResult SetReady(uint64_t UserId, bool bReady, uint32_t& OutRoomId)
 }
 
 ERoomResult StartGame(uint64_t HostUserId, uint32_t& OutRoomId,
-                      std::string& OutHostAddress, uint16_t& OutHostPort,
+                      std::vector<HostCandidate>& OutCandidates,
                       std::vector<uint64_t>& OutNotifyUserIds)
 {
 	OutRoomId = 0;
@@ -312,14 +311,14 @@ ERoomResult StartGame(uint64_t HostUserId, uint32_t& OutRoomId,
 	R->State = ERoomState::InGame;   // 목록에서 사라진다
 
 	OutRoomId      = R->RoomId;
-	OutHostAddress = R->HostAddress;
-	OutHostPort    = R->HostPort;
+	OutCandidates = R->Candidates;
+
 	CollectMemberIds(*R, /*Except=*/0, OutNotifyUserIds);   // 방장도 포함
 	return ERoomResult::Success;
 }
 
 ERoomResult MarkHostReady(uint64_t HostUserId, uint32_t& OutRoomId,
-                          std::string& OutHostAddress, uint16_t& OutHostPort,
+                          std::vector<HostCandidate>& OutCandidates,
                           std::vector<uint64_t>& OutNotifyUserIds)
 {
 	OutRoomId = 0;
@@ -344,8 +343,8 @@ ERoomResult MarkHostReady(uint64_t HostUserId, uint32_t& OutRoomId,
 	}
 
 	OutRoomId      = R->RoomId;
-	OutHostAddress = R->HostAddress;
-	OutHostPort    = R->HostPort;
+	OutCandidates = R->Candidates;
+
 
 	// 방장은 뺀다. 이 신호를 보낸 당사자이고, 이미 자기 리슨서버 안에 있다.
 	CollectMemberIds(*R, /*Except=*/HostUserId, OutNotifyUserIds);
