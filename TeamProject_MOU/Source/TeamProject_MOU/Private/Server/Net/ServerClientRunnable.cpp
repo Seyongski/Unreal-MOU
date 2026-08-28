@@ -412,6 +412,7 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.Join.RoomId      = static_cast<int32>(Ack.RoomId);
 		Event.Join.Result      = static_cast<EMOURoomResultBP>(Ack.Result);
 		MOUChat::ReadHostCandidates(Ack.Candidates, Ack.CandidateCount, Event.Join.Candidates);
+		Event.Join.bLanOnly    = (Ack.bLanOnly != 0);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}
@@ -501,6 +502,7 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.Join.bSuccess    = true;
 		Event.Join.RoomId      = static_cast<int32>(Start.RoomId);
 		MOUChat::ReadHostCandidates(Start.Candidates, Start.CandidateCount, Event.Join.Candidates);
+		Event.Join.bLanOnly    = (Start.bLanOnly != 0);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}
@@ -523,6 +525,26 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.Join.bSuccess    = true;
 		Event.Join.RoomId      = static_cast<int32>(Ready.RoomId);
 		MOUChat::ReadHostCandidates(Ready.Candidates, Ready.CandidateCount, Event.Join.Candidates);
+		Event.Join.bLanOnly    = (Ready.bLanOnly != 0);
+		InboundEvents.Enqueue(MoveTemp(Event));
+		break;
+	}
+
+	case MOU::EOpcode::HostProbeSent:
+	{
+		if (Body.Num() < static_cast<int32>(sizeof(MOU::HostProbeSentBody)))
+		{
+			UE_LOG(LogMOUServer, Warning, TEXT("HostProbeSent 크기가 부족하다 (%d바이트)"), Body.Num());
+			break;
+		}
+
+		MOU::HostProbeSentBody Sent{};
+		FMemory::Memcpy(&Sent, Body.GetData(), sizeof(Sent));
+
+		FServerClientEvent Event;
+		Event.Type       = EServerClientEventType::HostProbeSent;
+		Event.ProbeNonce = Sent.Nonce;
+		Event.bProbeSent = (Sent.bSent != 0);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}

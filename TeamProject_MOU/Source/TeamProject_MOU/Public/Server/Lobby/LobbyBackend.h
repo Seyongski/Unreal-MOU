@@ -108,7 +108,17 @@ enum class EServerClientEventType : uint8
 	/** DM 한 통 도착(실시간 또는 로그인 시 밀린 것). DirectMessage 가 유효하다 */
 	DirectMessage,
 	/** 대화 기록 도착. History / PeerUserId / bHasMoreHistory 가 유효하다 */
-	DmHistoryAck
+	DmHistoryAck,
+
+	// --- 도달성 프로브 (v9) ---
+
+	/**
+	 * 서버가 프로브 UDP 를 쐈다(또는 못 쐈다). ProbeNonce / bProbeSent 가 유효하다.
+	 *
+	 * 호스트는 이 신호를 받은 뒤부터 시간을 센다. 서버가 쏘기 전부터 세면
+	 * 왕복 지연만큼 손해를 보고, 서버가 못 쐈는데 기다리는 일도 생긴다.
+	 */
+	HostProbeSent
 };
 
 /**
@@ -137,6 +147,10 @@ struct FServerClientEvent
 	int32            RoomId = 0;
 	EMOURoomResultBP RoomResult = EMOURoomResultBP::Success;
 	bool             bRoomSuccess = false;
+
+	/** Type == HostProbeSent 일 때만 유효 (v9) */
+	uint32 ProbeNonce  = 0;
+	bool   bProbeSent  = false;
 
 	/**
 	 * Type == RoomMemberList 일 때만 유효.
@@ -287,6 +301,18 @@ public:
 	 * 위젯이나 게임 로직이 직접 부를 일은 없다.
 	 */
 	virtual void NotifyHostReady() = 0;
+
+	// ── 도달성 프로브 (v9) ────────────────────────────────────────────
+	//
+	// UPnP 가 "매핑 성공" 이라고 해도 실제로 패킷이 들어온다는 보장이 없다.
+	// 규칙을 기록만 하고 NAT 테이블에 반영하지 않는 공유기가 있다 — 실측으로 확인했다.
+	// 믿지 말고 한 발 받아본다.
+
+	/** 서버에게 "내 공인주소:이 포트로 UDP 를 한 발 쏴달라" 고 청한다. */
+	virtual void RequestHostProbe(int32 Port, uint32 Nonce) = 0;
+
+	/** 프로브 결과를 신고한다. 거짓이면 그 방은 같은 LAN 전용이 된다. */
+	virtual void ReportReachability(bool bReachable) = 0;
 
 	virtual void UpdateRoomState(int32 RoomId, int32 CurrentPlayers, bool bInGame) = 0;
 

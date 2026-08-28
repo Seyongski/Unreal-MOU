@@ -463,3 +463,45 @@ void FSocketLobbyBackend::UpdateRoomState(int32 RoomId, int32 CurrentPlayers, bo
 		ServerClient->EnqueuePacket(MoveTemp(Packet));
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 도달성 프로브 (v9)
+// ---------------------------------------------------------------------------
+
+void FSocketLobbyBackend::RequestHostProbe(int32 Port, uint32 Nonce)
+{
+	if (ServerClient == nullptr)
+	{
+		return;
+	}
+
+	MOU::HostProbeReqBody Request{};
+	Request.Nonce = Nonce;
+	Request.Port  = static_cast<uint16>(Port);
+
+	TArray<uint8> Packet;
+	if (MOUChat::BuildPacket(Packet, MOU::EOpcode::HostProbeReq, &Request, sizeof(Request)))
+	{
+		ServerClient->EnqueuePacket(MoveTemp(Packet));
+		UE_LOG(LogMOUServer, Log, TEXT("HostProbeReq 전송: 포트 %d (nonce %u)"), Port, Nonce);
+	}
+}
+
+void FSocketLobbyBackend::ReportReachability(bool bReachable)
+{
+	if (ServerClient == nullptr)
+	{
+		return;
+	}
+
+	MOU::RoomReachabilityReqBody Request{};
+	Request.bReachable = bReachable ? 1 : 0;
+
+	TArray<uint8> Packet;
+	if (MOUChat::BuildPacket(Packet, MOU::EOpcode::RoomReachabilityReq, &Request, sizeof(Request)))
+	{
+		ServerClient->EnqueuePacket(MoveTemp(Packet));
+		UE_LOG(LogMOUServer, Log, TEXT("RoomReachabilityReq 전송: %s"),
+			bReachable ? TEXT("외부 접속 가능") : TEXT("같은 LAN 전용"));
+	}
+}

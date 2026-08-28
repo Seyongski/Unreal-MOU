@@ -357,6 +357,20 @@ UNatPortMappingSubsystem* URoomCreateWidgetBase::GetNatSubsystem() const
 
 void URoomCreateWidgetBase::HandleNatMappingFinished(EMOUNatResultBP Result, int32 ExternalPort, const FString& ExternalIp)
 {
+	// ★ 매핑이 끝났으니 이제 **실제로 들어오는지** 확인한다. (v9)
+	//
+	//   UPnP 가 성공을 보고해도 패킷이 들어온다는 보장이 없다 — 규칙을 기록만 하고
+	//   NAT 테이블에 반영하지 않는 공유기가 있다. 실측으로 확인한 문제다.
+	//   여기가 확인하기 가장 좋은 시점이다: 로비 맵이라 게임 포트가 비어 있고,
+	//   사용자는 아직 방 제목을 입력하는 중이라 몇 초를 써도 티가 나지 않는다.
+	if (UServerSubsystem* Server = GetServerSubsystem())
+	{
+		if (!Server->IsProbingReachability())
+		{
+			Server->BeginReachabilityProbe(HostPort);
+		}
+	}
+
 	// 사용자가 이미 "방 만들기" 를 눌러 기다리고 있었다면, 지금이 보낼 때다.
 	if (bCreateWaitingForNat)
 	{

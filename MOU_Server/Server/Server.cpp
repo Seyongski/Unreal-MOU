@@ -94,6 +94,43 @@ namespace
 		return GPublicIp;
 	}
 
+	/**
+	 * 도달성 프로브를 쏠 UDP 소켓. (v9)
+	 *
+	 * ★ 보내기 전용이다. bind 하지 않으므로 서버 쪽 공유기에 인바운드 포워딩을
+	 *   새로 넣을 필요가 없다. 응답은 UDP 가 아니라 호스트가 TCP 로 신고한다.
+	 *
+	 * 한 번 만들어 두고 계속 쓴다. 프로브마다 소켓을 새로 여는 것은 낭비고,
+	 * 짧은 시간에 여러 방이 만들어지면 소켓 고갈로 이어질 수 있다.
+	 */
+	SocketHandle GProbeSock = kInvalidSocket;
+
+	/** 호스트의 공인주소:포트 로 프로브 한 발. 성공하면 true. */
+	bool SendHostProbe(const std::string& Address, uint16_t Port, uint32_t Nonce)
+	{
+		if (GProbeSock == kInvalidSocket || Address.empty() || Port == 0)
+		{
+			return false;
+		}
+
+		sockaddr_in Dest{};
+		Dest.sin_family = AF_INET;
+		Dest.sin_port   = ::htons(Port);
+		if (::inet_pton(AF_INET, Address.c_str(), &Dest.sin_addr) != 1)
+		{
+			return false;
+		}
+
+		HostProbeDatagram Datagram{};
+		Datagram.Magic = kHostProbeMagic;
+		Datagram.Nonce = Nonce;
+
+		const int Sent = ::sendto(GProbeSock, reinterpret_cast<const char*>(&Datagram),
+		                          static_cast<int>(sizeof(Datagram)), 0,
+		                          reinterpret_cast<const sockaddr*>(&Dest), sizeof(Dest));
+		return Sent == static_cast<int>(sizeof(Datagram));
+	}
+
 	/** HostCandidate 하나를 채운다. 주소가 비었거나 너무 길면 아무것도 하지 않고 false. */
 	bool PushCandidate(std::vector<HostCandidate>& Out, const std::string& Address,
 	                   uint16_t Port, EHostAddrKind Kind)
@@ -925,13 +962,15 @@ namespace
 		const std::string Password(Req.Password, kRoomPasswordLen);
 
 		std::vector<HostCandidate> Candidates;
+		bool bLanOnly = false;
 		const ERoomResult R = Rooms::Join(Req.RoomId, Session->UserId, Session->Name,
-		                                  Password, Candidates);
+		                                  Password, Candidates, bLanOnly);
 
 		Ack.RoomId = Req.RoomId;
 		if (R == ERoomResult::Success)
 		{
 			Ack.CandidateCount = FillCandidates(Ack.Candidates, Candidates);
+			Ack.bLanOnly       = bLanOnly ? 1 : 0;
 			std::printf("[방 참여] #%u <- %s(%llu), 주소 후보 %u개 전달\n",
 			            Req.RoomId, Session->Name.c_str(),
 			            static_cast<unsigned long long>(Session->UserId),
@@ -1026,8 +1065,9 @@ namespace
 		std::vector<HostCandidate> Candidates;
 		std::vector<uint64_t> Recipients;
 
+		bool bLanOnly = false;
 		const ERoomResult R = Rooms::StartGame(Session->UserId, RoomId,
-		                                       Candidates, Recipients);
+		                                       Candidates, bLanOnly, Recipients);
 		if (R != ERoomResult::Success)
 		{
 			std::printf("[거부] 게임 시작 실패: %s(%llu) (사유 %u)\n", Session->Name.c_str(),
@@ -1041,6 +1081,7 @@ namespace
 		RoomStartBody Start{};
 		Start.RoomId         = RoomId;
 		Start.CandidateCount = FillCandidates(Start.Candidates, Candidates);
+		Start.bLanOnly       = bLanOnly ? 1 : 0;
 
 		SendToUsers(Recipients, EOpcode::RoomStart, &Start, sizeof(Start), nullptr, 0);
 
@@ -1063,6 +1104,66 @@ namespace
 	 *   호스트는 이 시점에 이미 자기 맵에서 게임을 돌리고 있다. 성공/실패를 받아도
 	 *   할 수 있는 일이 없다. 거부 사유는 서버 콘솔에만 남긴다.
 	 */
+	/**
+	 * 호스트가 "내 공인주소:포트 로 UDP 를 한 발 쏴달라" 고 요청했다. (v9)
+	 *
+	 * 서버가 하는 일은 쏘는 것까지다. 그 패킷이 실제로 도착했는지는 호스트만 알고,
+	 * 결과는 RoomReachabilityReq 로 다시 올라온다.
+	 *
+	 * ★ 목적지 주소는 **세션의 피어 주소**를 쓴다. 클라이언트가 보낸 주소로 쏘면
+	 *   이 서버가 남에게 UDP 를 대신 쏴주는 도구가 된다.
+	 *   클라이언트가 정하는 것은 포트 하나뿐이다.
+	 */
+	bool HandleHostProbeReq(const SessionPtr& Session, const char* Body, uint32_t BodySize)
+	{
+		if (!Session->bAuthed || BodySize < sizeof(HostProbeReqBody))
+		{
+			return true;
+		}
+
+		HostProbeReqBody Req{};
+		std::memcpy(&Req, Body, sizeof(Req));
+
+		const bool bSent = SendHostProbe(Session->PeerAddress, Req.Port, Req.Nonce);
+
+		std::printf("[프로브] %s(%llu) 의 %s:%u 로 UDP 발사 %s\n",
+		            Session->Name.c_str(),
+		            static_cast<unsigned long long>(Session->UserId),
+		            Session->PeerAddress.c_str(), Req.Port,
+		            bSent ? "성공" : "실패");
+
+		HostProbeSentBody Ack{};
+		Ack.Nonce = Req.Nonce;
+		Ack.bSent = bSent ? 1 : 0;
+		return SendPacket(Session->Sock, EOpcode::HostProbeSent, &Ack, sizeof(Ack));
+	}
+
+	/** 호스트가 프로브 결과를 신고했다. 방에 표시만 하고 판정하지 않는다. (v9) */
+	bool HandleRoomReachabilityReq(const SessionPtr& Session, const char* Body, uint32_t BodySize)
+	{
+		if (!Session->bAuthed || BodySize < sizeof(RoomReachabilityReqBody))
+		{
+			return true;
+		}
+
+		RoomReachabilityReqBody Req{};
+		std::memcpy(&Req, Body, sizeof(Req));
+
+		uint32_t RoomId = 0;
+		const ERoomResult R = Rooms::SetReachability(Session->UserId, Req.bReachable != 0, RoomId);
+		if (R != ERoomResult::Success)
+		{
+			std::printf("[거부] 도달성 신고 실패: %s(%llu) (사유 %u)\n", Session->Name.c_str(),
+			            static_cast<unsigned long long>(Session->UserId), static_cast<unsigned>(R));
+			return true;
+		}
+
+		std::printf("[도달성] 방 #%u 는 %s\n", RoomId,
+		            Req.bReachable ? "외부에서 들어올 수 있다"
+		                           : "**같은 LAN 에서만** 들어올 수 있다 (공유기가 포워딩을 안 한다)");
+		return true;
+	}
+
 	bool HandleRoomHostReadyReq(const SessionPtr& Session, const char*, uint32_t)
 	{
 		if (!Session->bAuthed)
@@ -1074,8 +1175,9 @@ namespace
 		std::vector<HostCandidate> Candidates;
 		std::vector<uint64_t> Recipients;
 
+		bool bLanOnly = false;
 		const ERoomResult R = Rooms::MarkHostReady(Session->UserId, RoomId,
-		                                           Candidates, Recipients);
+		                                           Candidates, bLanOnly, Recipients);
 		if (R != ERoomResult::Success)
 		{
 			std::printf("[거부] 호스트 준비 신고 실패: %s(%llu) (사유 %u)\n", Session->Name.c_str(),
@@ -1089,6 +1191,7 @@ namespace
 		RoomHostReadyBody Ready{};
 		Ready.RoomId         = RoomId;
 		Ready.CandidateCount = FillCandidates(Ready.Candidates, Candidates);
+		Ready.bLanOnly       = bLanOnly ? 1 : 0;
 
 		SendToUsers(Recipients, EOpcode::RoomHostReady, &Ready, sizeof(Ready), nullptr, 0);
 		return true;
@@ -1610,6 +1713,10 @@ namespace
 		case EOpcode::RoomReadyReq:    return HandleRoomReadyReq(Session, Data, Size);
 		case EOpcode::RoomStartReq:    return HandleRoomStartReq(Session, Data, Size);
 		case EOpcode::RoomHostReadyReq: return HandleRoomHostReadyReq(Session, Data, Size);
+
+		// --- 도달성 프로브 (v9) ---
+		case EOpcode::HostProbeReq:        return HandleHostProbeReq(Session, Data, Size);
+		case EOpcode::RoomReachabilityReq: return HandleRoomReachabilityReq(Session, Data, Size);
 		case EOpcode::ChatSend:  return HandleChatSend(Session, Data, Size);
 		case EOpcode::SetDead:   return HandleSetDead(Session, Data, Size);
 
@@ -1795,6 +1902,17 @@ int main(int argc, char** argv)
 	{
 		std::printf("socket() 실패: %d\n", LastNetError());
 		return 1;
+	}
+
+	// 도달성 프로브용 UDP 소켓. (v9)
+	// bind 하지 않는다 — 보내기만 하므로 OS 가 알아서 임시 포트를 잡는다.
+	// 실패해도 서버는 그대로 돈다. 프로브만 못 하게 될 뿐이고, 그때는 방이
+	// "모름(=예전처럼 동작)" 으로 남는다.
+	GProbeSock = ::socket(PF_INET, SOCK_DGRAM, 0);
+	if (GProbeSock == kInvalidSocket)
+	{
+		std::printf("[경고] 프로브용 UDP 소켓을 못 만들었다(%d). 도달성 확인 없이 진행한다.\n",
+		            LastNetError());
 	}
 
 	sockaddr_in ServerAddr{};

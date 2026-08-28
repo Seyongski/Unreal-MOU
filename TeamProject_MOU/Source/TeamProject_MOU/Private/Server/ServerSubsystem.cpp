@@ -24,6 +24,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/NetDriver.h"
 #include "SocketSubsystem.h"
+#include "Sockets.h"                          // FSocket (도달성 프로브가 직접 쓴다)
 #include "IPAddress.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"   // ClientTravel (참여자 여행)
@@ -124,6 +125,13 @@ void UServerSubsystem::ShutdownClient()
 	// 리슨서버 감시도 같이 끈다. 붙을 서버가 없는데 신호를 준비하고 있을 이유가 없다.
 	bWaitingForListenServer = false;
 	ListenServerWaitSeconds = 0.f;
+
+	// ★ 프로브 소켓이 열려 있으면 반드시 닫는다. 게임 포트를 잡고 있어서,
+	//   남겨두면 다음에 리슨서버가 같은 포트를 못 연다.
+	if (bProbing)
+	{
+		FinishReachabilityProbe(false, TEXT("종료 중이라 확인을 중단했습니다."));
+	}
 
 	if (ConnectionState != EChatConnectionState::Disconnected)
 	{
@@ -691,6 +699,7 @@ bool UServerSubsystem::Tick(float DeltaTime)
 	//    사건 처리보다 먼저 하는 이유는 없다. 서로 독립적이다.
 	PollListenServer(DeltaTime);
 	PollGuestHostReadyTimeout(DeltaTime);
+	PollReachabilityProbe(DeltaTime);
 
 	// 1) 상태 변화 처리
 	FServerClientEvent Event;
@@ -903,6 +912,23 @@ bool UServerSubsystem::Tick(float DeltaTime)
 			}
 			break;
 		}
+
+		case EServerClientEventType::HostProbeSent:
+			// 서버가 쐈다. 지금부터 도착을 기다린다.
+			if (bProbing && Event.ProbeNonce == ProbeNonce)
+			{
+				if (Event.bProbeSent)
+				{
+					bProbeDispatched = true;
+					ProbeWaitSeconds = 0.f;
+				}
+				else
+				{
+					// 서버가 쏘지 못했다. 기다려봐야 오지 않는다.
+					FinishReachabilityProbe(false, TEXT("서버가 확인용 패킷을 보내지 못했습니다."));
+				}
+			}
+			break;
 
 		case EServerClientEventType::Disconnected:
 			LoginResult = FChatLoginResult();
@@ -1217,6 +1243,186 @@ namespace
 	}
 }
 
+// ---------------------------------------------------------------------------
+// 도달성 프로브 (v9)
+//
+// 흐름:
+//   BeginReachabilityProbe  프로브 소켓을 게임 포트에 bind, 서버에 "쏴달라"
+//   HostProbeSent 수신      서버가 쐈다. 여기서부터 센다
+//   PollReachabilityProbe   매 틱 논블로킹으로 들여다본다
+//   FinishReachabilityProbe 결과를 알리고 소켓을 닫는다
+//
+// ★ 소켓을 반드시 닫아야 한다. 열어둔 채 OpenLevel 하면 리슨서버가 같은 포트를
+//   잡지 못한다. 그래서 닫는 경로를 FinishReachabilityProbe 하나로 모았다.
+// ---------------------------------------------------------------------------
+
+void UServerSubsystem::BeginReachabilityProbe(int32 Port)
+{
+	if (bProbing)
+	{
+		UE_LOG(LogMOUServer, Warning, TEXT("[프로브] 이미 진행 중이다."));
+		return;
+	}
+	if (!Backend.IsValid() || Port <= 0 || Port > 65535)
+	{
+		return;
+	}
+
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (Sockets == nullptr)
+	{
+		FinishReachabilityProbe(false, TEXT("소켓 시스템을 찾지 못했습니다."));
+		return;
+	}
+
+	FSocket* Socket = Sockets->CreateSocket(NAME_DGram, TEXT("MOU.Reachability"), FNetworkProtocolTypes::IPv4);
+	if (Socket == nullptr)
+	{
+		FinishReachabilityProbe(false, TEXT("프로브 소켓을 만들지 못했습니다."));
+		return;
+	}
+
+	Socket->SetNonBlocking(true);
+
+	// ★ SetReuseAddr 를 쓰지 않는다.
+	//   윈도우에서 SO_REUSEADDR 는 이미 쓰고 있는 UDP 포트에 두 번째 소켓이
+	//   끼어들 수 있게 만든다. 그러면 들어온 패킷이 둘 중 하나에만 가고,
+	//   프로브는 "안 왔다" 고 오판한다. 이미 쓰는 중이면 bind 가 실패하게 두고
+	//   그 사실을 그대로 알리는 편이 정직하다.
+
+	// 게임 포트 그대로 열어야 의미가 있다. 다른 포트로 확인하면 "그 포트가 열렸다" 만
+	// 알게 되고, 정작 리슨서버가 쓸 포트는 검증되지 않는다.
+	TSharedRef<FInternetAddr> BindAddr = Sockets->CreateInternetAddr();
+	BindAddr->SetAnyAddress();
+	BindAddr->SetPort(Port);
+	if (!Socket->Bind(*BindAddr))
+	{
+		Sockets->DestroySocket(Socket);
+		// 대개 리슨서버나 다른 프로세스가 이미 잡고 있다는 뜻이다.
+		FinishReachabilityProbe(false,
+			FString::Printf(TEXT("포트 %d 를 열지 못했습니다. 이미 다른 프로그램이 쓰고 있습니다."), Port));
+		return;
+	}
+
+	ProbeSocket       = Socket;
+	ProbePort         = Port;
+	// 0 은 "아직 없음" 과 구분이 안 되므로 피한다.
+	ProbeNonce        = FMath::Max(1u, static_cast<uint32>(FMath::Rand()) ^ static_cast<uint32>(FPlatformTime::Cycles()));
+	ProbeWaitSeconds  = 0.f;
+	ProbeTotalSeconds = 0.f;
+	bProbeDispatched  = false;
+	bProbing          = true;
+
+	UE_LOG(LogMOUServer, Log, TEXT("[프로브] 포트 %d 에서 대기 시작. 서버에 발사를 청한다(nonce %u)."),
+		Port, ProbeNonce);
+
+	Backend->RequestHostProbe(Port, ProbeNonce);
+}
+
+void UServerSubsystem::PollReachabilityProbe(float DeltaTime)
+{
+	if (!bProbing || ProbeSocket == nullptr)
+	{
+		return;
+	}
+
+	ProbeTotalSeconds += DeltaTime;
+
+	// 서버가 "쐈다" 고 답하기 전까지는 도착을 기대할 수 없다. 다만 그 답 자체가
+	// 안 올 수도 있으므로(연결이 끊겼다든지) 전체 상한을 따로 둔다.
+	if (!bProbeDispatched)
+	{
+		if (ProbeTotalSeconds >= 10.f)
+		{
+			FinishReachabilityProbe(false, TEXT("서버가 프로브 요청에 응답하지 않았습니다."));
+		}
+		return;
+	}
+
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (Sockets == nullptr)
+	{
+		FinishReachabilityProbe(false, TEXT("소켓 시스템을 찾지 못했습니다."));
+		return;
+	}
+
+	// 논블로킹이라 안 왔으면 즉시 false 로 떨어진다. 매 틱 불러도 부담이 없다.
+	uint8 Buffer[64];
+	int32 Read = 0;
+	TSharedRef<FInternetAddr> From = Sockets->CreateInternetAddr();
+
+	while (ProbeSocket->RecvFrom(Buffer, sizeof(Buffer), Read, *From))
+	{
+		if (Read < static_cast<int32>(sizeof(MOU::HostProbeDatagram)))
+		{
+			continue;   // 우리 것이 아니다
+		}
+
+		MOU::HostProbeDatagram Datagram{};
+		FMemory::Memcpy(&Datagram, Buffer, sizeof(Datagram));
+
+		// ★ Magic 과 Nonce 를 둘 다 본다. 이 포트는 곧 게임 포트라 지나가던 다른
+		//   트래픽이 들어올 수 있고, 지난 판의 늦은 응답이 올 수도 있다.
+		if (Datagram.Magic != MOU::kHostProbeMagic || Datagram.Nonce != ProbeNonce)
+		{
+			continue;
+		}
+
+		FinishReachabilityProbe(true,
+			FString::Printf(TEXT("외부(%s)에서 보낸 패킷이 도착했습니다."), *From->ToString(false)));
+		return;
+	}
+
+	ProbeWaitSeconds += DeltaTime;
+
+	// 5초면 충분하다. 서버는 이미 쐈고, LAN 왕복이 아니라 인터넷 왕복이어도
+	// 그 안에 못 오면 오지 않는 것이다.
+	if (ProbeWaitSeconds >= 5.f)
+	{
+		FinishReachabilityProbe(false,
+			TEXT("공유기가 외부 접속을 넘겨주지 않습니다. 같은 공유기 안의 인원만 참여할 수 있습니다."));
+	}
+}
+
+void UServerSubsystem::FinishReachabilityProbe(bool bReachable, const FString& Detail)
+{
+	// ★ 소켓을 여기서만 닫는다. 남겨두면 리슨서버가 같은 포트를 못 잡는다.
+	if (ProbeSocket != nullptr)
+	{
+		if (ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
+		{
+			ProbeSocket->Close();
+			Sockets->DestroySocket(ProbeSocket);
+		}
+		ProbeSocket = nullptr;
+	}
+
+	bProbing          = false;
+	bProbeDispatched  = false;
+	ProbeWaitSeconds  = 0.f;
+	ProbeTotalSeconds = 0.f;
+	ProbeNonce        = 0;
+
+	if (bReachable)
+	{
+		UE_LOG(LogMOUServer, Log, TEXT("[프로브] 외부에서 들어올 수 있다. %s"), *Detail);
+	}
+	else
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("[프로브] 외부에서 들어올 수 **없다**. %s\n")
+			TEXT("         이 방은 같은 공유기 안의 인원만 참여할 수 있다."), *Detail);
+	}
+
+	// 서버에도 알려서 방에 표시한다. 참여자가 그것을 보고 헛걸음을 피한다.
+	if (Backend.IsValid())
+	{
+		Backend->ReportReachability(bReachable);
+	}
+
+	OnReachabilityChecked.Broadcast(bReachable, Detail);
+}
+
 FString UServerSubsystem::GetLocalLanAddress()
 {
 	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
@@ -1340,6 +1546,19 @@ void UServerSubsystem::TravelAsHost()
 		return;
 	}
 
+	// ★ 프로브가 아직 돌고 있으면 그 소켓이 게임 포트를 잡고 있다.
+	//   그대로 OpenLevel 하면 리슨서버가 bind 에 실패하고, 그러면 참여자에게
+	//   출발 신호가 영영 안 나간다. 확인보다 게임 시작이 우선이므로 접는다.
+	//
+	//   보통은 방을 만든 뒤 전원이 준비할 때까지 시간이 충분해서 여기 걸리지 않는다.
+	//   혼자 만들고 바로 시작하는 경우에만 해당한다.
+	if (bProbing)
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("[프로브] 아직 확인 중인데 게임이 시작됐다. 포트를 놓아주려고 확인을 접는다."));
+		FinishReachabilityProbe(false, TEXT("게임이 먼저 시작되어 확인을 마치지 못했습니다."));
+	}
+
 	// listen 옵션이 있어야 이 클라이언트가 리슨서버가 된다.
 	// RoomPassword 를 URL 에 같이 실어야 새 레벨의 GameMode 가 InitGame 에서
 	// 그 값을 읽어 보관하고, 나중에 PreLogin 에서 참여자를 검사할 수 있다.
@@ -1380,6 +1599,19 @@ bool UServerSubsystem::TravelToHost()
 		UE_LOG(LogMOUServer, Error, TEXT("[참여자] 쓸 수 있는 호스트 주소가 없다: %s"),
 			*PendingHostReady.ToDisplayString());
 		OnTravelFailed.Broadcast(TEXT("방장의 접속 주소를 받지 못했습니다."));
+		return false;
+	}
+
+	// ★ 방장이 도달성 프로브에 실패했는데 내가 공인 후보를 골랐다면, 이 접속은
+	//   **반드시** 실패한다. 시도하면 핸드셰이크 타임아웃까지 1분 가까이 화면이
+	//   멈춘 뒤에야 같은 결론에 도달한다. 아는 것을 굳이 확인하지 않는다.
+	if (PendingHostReady.bLanOnly && Chosen.Kind != EMOUHostAddrKindBP::Lan)
+	{
+		const FString Reason = TEXT(
+			"이 방은 같은 공유기 안에서만 참여할 수 있습니다.\n"
+			"방장 쪽 공유기가 외부 접속을 넘겨주지 않습니다.");
+		UE_LOG(LogMOUServer, Warning, TEXT("[참여자] %s"), *Reason);
+		OnTravelFailed.Broadcast(Reason);
 		return false;
 	}
 

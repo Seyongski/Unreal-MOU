@@ -34,7 +34,13 @@ namespace MOU
 	//            막혔다 — 바로 옆자리 사람이 못 들어오는데 원인이 안 보였다.
 	//            이제 공인 주소와 사설(LAN) 주소를 같이 내려주고, 받는 쪽이 자기
 	//            네트워크에 맞는 것을 고른다. 실패하면 다음 후보로 넘어간다.
-	constexpr uint16_t kProtocolVersion = 8;
+	//   8 -> 9 : 도달성 프로브 추가. UPnP 매핑이 "성공" 해도 실제로 패킷이 들어온다는
+	//            보장이 없다는 것을 실측으로 확인했다 — 매핑 Enabled=1, 리슨서버 바인드
+	//            정상, 방화벽 Allow 인데도 외부에서 보낸 패킷이 하나도 도착하지 않았다.
+	//            이제 서버가 호스트에게 UDP 를 한 발 쏴서 실제로 받아지는지 확인하고,
+	//            안 되면 그 방을 "같은 LAN 전용" 으로 표시한다. 참여자는 죽은 주소로
+	//            달려가는 대신 그 자리에서 사유를 본다.
+	constexpr uint16_t kProtocolVersion = 9;
 
 	// BodySize 가 이 값을 넘으면 악성 패킷으로 보고 연결을 끊는다.
 	constexpr uint32_t kMaxBodySize = 4096;
@@ -176,6 +182,63 @@ namespace MOU
 		DirectMessage     = 37,  // S->C. DM 도착 (실시간 또는 로그인 시 밀린 것)
 		DmHistoryReq      = 38,  // C->S. 대화 기록 (창 열기 / 위로 스크롤)
 		DmHistoryAck      = 39,  // S->C. 뒤에 DmEntry N개
+
+		// --- 도달성 프로브 (v9) ---
+		//
+		// [무엇을 푸는가]
+		//   UPnP 매핑이 "성공" 해도 실제로 패킷이 들어온다는 보장이 없다.
+		//   규칙을 기록만 하고 NAT 테이블에 반영하지 않는 공유기가 있고, ISP 가
+		//   인바운드 UDP 를 거르기도 한다. 실측으로 확인한 사례다 —
+		//   매핑 Enabled=1, 리슨서버 바인드 정상, 방화벽 Allow, 그런데 외부에서
+		//   보낸 패킷이 하나도 도착하지 않았다.
+		//
+		//   그런 방에서 게임을 시작하면 참여자 전원이 죽은 주소로 달려간다.
+		//   "열렸다" 를 믿지 말고 **실제로 한 발 받아보는** 것이 이 프로브다.
+		//
+		// [왜 서버가 쏘는가]
+		//   호스트가 자기 자신에게 쏘면 공유기를 거치지 않아 아무것도 증명하지 못한다.
+		//   바깥에서 오는 패킷이어야 의미가 있고, 서버는 이미 바깥에 있다.
+		//   서버는 **보내기만** 한다 — 판정은 호스트가 하고, 결과만 다시 신고한다.
+		//   그래서 서버 쪽에 인바운드 UDP 포워딩이 새로 필요하지 않다.
+		HostProbeReq        = 40,  // C->S. "내 공인주소:이 포트로 UDP 한 발 쏴달라"
+		HostProbeSent       = 41,  // S->C. "쐈다" (또는 못 쐈다). 호스트는 이때부터 센다
+		RoomReachabilityReq = 42,  // C->S. "내 방은 외부에서 들어올 수 있다/없다"
+	};
+
+	/**
+	 * 서버가 호스트에게 쏘는 UDP 프로브 한 발.
+	 *
+	 * 이 바이트열은 TCP 프레이밍(PacketHeader)을 타지 않는다. 생 UDP 데이터그램이다.
+	 * Magic 이 있는 이유: 호스트가 bind 한 포트는 곧 게임 포트라, 지나가던 다른
+	 * 트래픽이 들어올 수 있다. 우리 프로브인지 먼저 가려야 한다.
+	 */
+	struct HostProbeDatagram
+	{
+		uint32_t Magic;    // kHostProbeMagic
+		uint32_t Nonce;    // HostProbeReqBody 에서 호스트가 정한 값
+	};
+
+	/** "MOUP". 프로브 데이터그램을 다른 UDP 트래픽과 구분한다. */
+	constexpr uint32_t kHostProbeMagic = 0x4D4F5550u;
+
+	struct HostProbeReqBody
+	{
+		uint32_t Nonce;    // 호스트가 매번 새로 정한다. 지난 판의 응답을 오인하지 않으려고
+		uint16_t Port;     // 리슨서버가 쓸 포트. 보통 7777
+		uint8_t  Reserved[2];
+	};
+
+	struct HostProbeSentBody
+	{
+		uint32_t Nonce;
+		uint8_t  bSent;    // 0 이면 서버가 쏘지 못했다 (소켓 문제 등)
+		uint8_t  Reserved[3];
+	};
+
+	struct RoomReachabilityReqBody
+	{
+		uint8_t bReachable;   // 0 이면 이 방은 같은 LAN 안에서만 들어올 수 있다
+		uint8_t Reserved[3];
 	};
 
 	/**
@@ -455,7 +518,7 @@ namespace MOU
 		uint8_t       CandidateCount;
 		uint8_t       bSuccess;
 		uint8_t       Result;                           // ERoomResult
-		uint8_t       Reserved;
+		uint8_t       bLanOnly;                         // 1 이면 같은 LAN 에서만 들어올 수 있다 (v9)
 	};
 
 	// 호스트가 진행 상태를 알린다. 방장만 보낼 수 있다.
@@ -518,7 +581,8 @@ namespace MOU
 		uint32_t      RoomId;
 		HostCandidate Candidates[kMaxHostCandidates];
 		uint8_t       CandidateCount;
-		uint8_t       Reserved[3];
+		uint8_t       bLanOnly;                        // 1 이면 같은 LAN 에서만 들어올 수 있다 (v9)
+		uint8_t       Reserved[2];
 	};
 
 	/**
@@ -540,7 +604,8 @@ namespace MOU
 		uint32_t      RoomId;
 		HostCandidate Candidates[kMaxHostCandidates];
 		uint8_t       CandidateCount;
-		uint8_t       Reserved[3];
+		uint8_t       bLanOnly;                        // 1 이면 같은 LAN 에서만 들어올 수 있다 (v9)
+		uint8_t       Reserved[2];
 	};
 
 	// ------------------------------------------------------------------
@@ -727,6 +792,10 @@ namespace MOU
 	static_assert(sizeof(RoomClosedBody)     ==  5, "RoomClosedBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomStartBody)      == 68, "RoomStartBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomHostReadyBody)  == 68, "RoomHostReadyBody 에 패딩이 끼었다");
+	static_assert(sizeof(HostProbeDatagram)     == 8, "HostProbeDatagram 에 패딩이 끼었다");
+	static_assert(sizeof(HostProbeReqBody)      == 8, "HostProbeReqBody 에 패딩이 끼었다");
+	static_assert(sizeof(HostProbeSentBody)     == 8, "HostProbeSentBody 에 패딩이 끼었다");
+	static_assert(sizeof(RoomReachabilityReqBody) == 4, "RoomReachabilityReqBody 에 패딩이 끼었다");
 
 	// 방 목록 한 번에 담을 수 있는지 확인한다. 넘치면 kMaxRoomsInList 를 줄여야 한다.
 	static_assert(sizeof(RoomListAckBody) + sizeof(RoomInfo) * kMaxRoomsInList <= kMaxBodySize,

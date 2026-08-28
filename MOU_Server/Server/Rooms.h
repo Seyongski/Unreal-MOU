@@ -77,7 +77,7 @@ namespace MOU
 		 */
 		ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
 		                 const std::string& Password,
-		                 std::vector<HostCandidate>& OutCandidates);
+		                 std::vector<HostCandidate>& OutCandidates, bool& bOutLanOnly);
 
 		/**
 		 * 방에서 나간다. 방장이 나가면 방이 통째로 사라진다.
@@ -110,6 +110,7 @@ namespace MOU
 		 */
 		ERoomResult StartGame(uint64_t HostUserId, uint32_t& OutRoomId,
 		                      std::vector<HostCandidate>& OutCandidates,
+		                      bool& bOutLanOnly,
 		                      std::vector<uint64_t>& OutNotifyUserIds);
 
 		/**
@@ -128,7 +129,19 @@ namespace MOU
 		 */
 		ERoomResult MarkHostReady(uint64_t HostUserId, uint32_t& OutRoomId,
 		                          std::vector<HostCandidate>& OutCandidates,
+		                          bool& bOutLanOnly,
 		                          std::vector<uint64_t>& OutNotifyUserIds);
+
+		/**
+		 * 호스트가 도달성 프로브 결과를 신고했다. (v9)
+		 *
+		 * 서버는 이 값을 판정하지 않고 그대로 받는다 — 패킷이 실제로 도착했는지는
+		 * 호스트 프로세스 안에서만 관측되기 때문이다. 서버가 하는 일은 UDP 를 한 발
+		 * 쏘는 것까지고, 그 뒤는 호스트가 알려줘야 안다.
+		 *
+		 * @return NotInRoom / NotHost / Success
+		 */
+		ERoomResult SetReachability(uint64_t HostUserId, bool bReachable, uint32_t& OutRoomId);
 
 		/**
 		 * 방의 현재 멤버 명단을 뜬다. RoomMemberList 를 만들 때 쓴다.

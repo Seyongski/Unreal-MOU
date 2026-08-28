@@ -239,6 +239,19 @@ struct FMOURoomJoinResult
 	UPROPERTY(BlueprintReadOnly, Category = "MOU|Lobby")
 	EMOURoomResultBP Result = EMOURoomResultBP::Success;
 
+	/**
+	 * 이 방은 같은 LAN 안에서만 들어올 수 있는가. (v9)
+	 *
+	 * 방장이 도달성 프로브에 실패했다는 뜻이다 — UPnP 매핑은 됐지만 공유기가
+	 * 실제로 포워딩을 하지 않거나 ISP 가 인바운드 UDP 를 거른다.
+	 *
+	 * 이 값이 참인데 내가 공인 후보를 골랐다면 **접속은 반드시 실패한다.**
+	 * 그럴 때는 시도하지 말고 그 자리에서 사유를 보여주는 편이 낫다 —
+	 * 시도하면 핸드셰이크 타임아웃까지 1분 가까이 화면이 멈춘다.
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "MOU|Lobby")
+	bool bLanOnly = false;
+
 	/** 로그와 화면에 쓸 요약. "218.153.186.240:7777(공인), 192.168.0.32:7777(LAN)" */
 	FString ToDisplayString() const
 	{

@@ -58,6 +58,8 @@ public:
 	virtual void SetReady(bool bReady) override;
 	virtual void StartGame() override;
 	virtual void NotifyHostReady() override;
+	virtual void RequestHostProbe(int32 Port, uint32 Nonce) override;
+	virtual void ReportReachability(bool bReachable) override;
 	virtual void UpdateRoomState(int32 RoomId, int32 CurrentPlayers, bool bInGame) override;
 
 	// --- 친구 / 메신저 (v7) ---

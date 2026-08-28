@@ -406,6 +406,40 @@ public:
 	 */
 	bool TryNextHostCandidate();
 
+	// ─────────────────────────────────────────────────────────────────
+	// 도달성 프로브 (v9)
+	//
+	// [왜 필요한가 — 실측으로 확인한 것]
+	//   UPnP 가 "매핑 성공" 이라고 답해도 실제로 패킷이 들어온다는 보장이 없다.
+	//   한 공유기에서 매핑 Enabled=1, 리슨서버 바인드 정상, 방화벽 Allow 였는데도
+	//   외부에서 보낸 패킷이 **하나도** 도착하지 않았다. 규칙을 기록만 하고
+	//   NAT 테이블에 반영하지 않는 펌웨어이거나 ISP 가 인바운드 UDP 를 거른 것이다.
+	//
+	//   그 상태로 게임을 시작하면 참여자 전원이 죽은 주소로 달려가 1분 가까이
+	//   화면이 멈춘 뒤에야 실패한다. "열렸다" 를 믿지 말고 한 발 받아봐야 한다.
+	// ─────────────────────────────────────────────────────────────────
+
+	/**
+	 * 외부에서 이 PC 의 게임 포트로 들어올 수 있는지 실제로 확인한다.
+	 *
+	 * 서버에게 "내 공인주소:이 포트로 UDP 한 발 쏴달라" 고 청하고, 그 패킷이
+	 * 도착하는지 본다. 결과는 OnReachabilityChecked 로 오고 서버에도 신고된다.
+	 *
+	 * ★ 리슨서버가 그 포트를 잡기 **전에** 불러야 한다. 방을 만드는 시점이
+	 *   적기다 — 그때는 로비 맵이라 넷드라이버가 없어서 포트가 비어 있다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MOU|Lobby")
+	void BeginReachabilityProbe(int32 Port = 7777);
+
+	/** 프로브 결과. bReachable 이 거짓이면 이 방은 같은 LAN 전용이다. */
+	DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FOnMOUReachabilityChecked, bool, bReachable, const FString&, Detail);
+	UPROPERTY(BlueprintAssignable, Category = "MOU|Lobby")
+	FOnMOUReachabilityChecked OnReachabilityChecked;
+
+	/** 프로브가 진행 중인가. 방 만들기 버튼이 이 값을 보고 기다린다. */
+	UFUNCTION(BlueprintPure, Category = "MOU|Lobby")
+	bool IsProbingReachability() const { return bProbing; }
+
 	/**
 	 * 지금 쓰고 있는 백엔드 이름. "자체 서버(TCP)" / "EOS".
 	 * 디버그 화면에 띄워두면 "어디에 붙어 있는지" 를 묻지 않아도 된다.
@@ -781,6 +815,24 @@ private:
 	 */
 	bool  bGuestWaitingForHostReady = false;
 	float GuestWaitSeconds = 0.f;
+
+	// ─── 도달성 프로브 상태 (v9) ─────────────────────────────────────
+	bool   bProbing = false;
+	uint32 ProbeNonce = 0;
+	int32  ProbePort = 0;
+	float  ProbeWaitSeconds = 0.f;
+	/** 서버가 "쐈다" 고 답했는가. 그때부터 시간을 센다. */
+	bool   bProbeDispatched = false;
+	/** HostProbeSent 를 기다리는 시간까지 포함한 전체 상한. */
+	float  ProbeTotalSeconds = 0.f;
+	/** 프로브 전용 UDP 소켓. 결과가 나오면 반드시 닫는다 — 게임 포트를 잡고 있다. */
+	class FSocket* ProbeSocket = nullptr;
+
+	/** 프로브를 끝내고 결과를 알린다. 소켓을 닫는 유일한 경로다. */
+	void FinishReachabilityProbe(bool bReachable, const FString& Detail);
+
+	/** 매 틱 프로브 소켓을 들여다본다. 논블로킹이라 비용이 사실상 없다. */
+	void PollReachabilityProbe(float DeltaTime);
 
 	/**
 	 * 미리 올린 맵 패키지. UPROPERTY 참조가 GC 를 막는다.

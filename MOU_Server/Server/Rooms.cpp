@@ -27,6 +27,17 @@ namespace
 		std::string HostName;
 		std::vector<HostCandidate> Candidates;   // 호스트에게 가는 길들 (v8). Server.cpp 가 만든다
 
+		/**
+		 * 이 방은 같은 LAN 안에서만 들어올 수 있는가. (v9)
+		 *
+		 * 호스트가 도달성 프로브 결과를 신고하면 켜진다. 서버가 스스로 판정하지 않는다 —
+		 * 패킷이 실제로 도착했는지는 호스트 프로세스 안에서만 관측되기 때문이다.
+		 *
+		 * 기본값이 false 인 이유: 프로브를 못 돌린 경우(구버전 클라, 프로브 실패)에
+		 * 방을 막아버리면 잘 되던 조합까지 못 쓰게 된다. 모르면 예전처럼 둔다.
+		 */
+		bool        bLanOnly = false;
+
 		std::string Title;
 		bool        bHasPassword = false;
 		std::string Password;       // 숫자 4자리. 방과 함께 사라지는 휘발성 값이다
@@ -160,7 +171,7 @@ ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
 
 ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
                  const std::string& Password,
-                 std::vector<HostCandidate>& OutCandidates)
+                 std::vector<HostCandidate>& OutCandidates, bool& bOutLanOnly)
 {
 	std::lock_guard<std::mutex> Lock(GMutex);
 
@@ -188,6 +199,7 @@ ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
 		if (M.UserId == UserId)
 		{
 			OutCandidates = R.Candidates;
+			bOutLanOnly   = R.bLanOnly;
 			return ERoomResult::Success;
 		}
 	}
@@ -210,6 +222,7 @@ ERoomResult Join(uint32_t RoomId, uint64_t UserId, const std::string& Name,
 	R.Members.push_back(std::move(NewMember));
 
 	OutCandidates = R.Candidates;
+	bOutLanOnly   = R.bLanOnly;
 
 	return ERoomResult::Success;
 }
@@ -280,8 +293,31 @@ ERoomResult SetReady(uint64_t UserId, bool bReady, uint32_t& OutRoomId)
 	return ERoomResult::NotInRoom;
 }
 
+ERoomResult SetReachability(uint64_t HostUserId, bool bReachable, uint32_t& OutRoomId)
+{
+	OutRoomId = 0;
+
+	std::lock_guard<std::mutex> Lock(GMutex);
+
+	Room* R = FindRoomOfMember(HostUserId);
+	if (R == nullptr)
+	{
+		return ERoomResult::NotInRoom;
+	}
+	if (R->HostUserId != HostUserId)
+	{
+		return ERoomResult::NotHost;
+	}
+
+	// 서버가 판정하지 않고 호스트의 신고를 그대로 받는다.
+	// 패킷이 실제로 도착했는지는 호스트 프로세스 안에서만 관측되기 때문이다.
+	R->bLanOnly = !bReachable;
+	OutRoomId   = R->RoomId;
+	return ERoomResult::Success;
+}
+
 ERoomResult StartGame(uint64_t HostUserId, uint32_t& OutRoomId,
-                      std::vector<HostCandidate>& OutCandidates,
+                      std::vector<HostCandidate>& OutCandidates, bool& bOutLanOnly,
                       std::vector<uint64_t>& OutNotifyUserIds)
 {
 	OutRoomId = 0;
@@ -312,13 +348,14 @@ ERoomResult StartGame(uint64_t HostUserId, uint32_t& OutRoomId,
 
 	OutRoomId      = R->RoomId;
 	OutCandidates = R->Candidates;
+	bOutLanOnly   = R->bLanOnly;
 
 	CollectMemberIds(*R, /*Except=*/0, OutNotifyUserIds);   // 방장도 포함
 	return ERoomResult::Success;
 }
 
 ERoomResult MarkHostReady(uint64_t HostUserId, uint32_t& OutRoomId,
-                          std::vector<HostCandidate>& OutCandidates,
+                          std::vector<HostCandidate>& OutCandidates, bool& bOutLanOnly,
                           std::vector<uint64_t>& OutNotifyUserIds)
 {
 	OutRoomId = 0;
@@ -344,6 +381,7 @@ ERoomResult MarkHostReady(uint64_t HostUserId, uint32_t& OutRoomId,
 
 	OutRoomId      = R->RoomId;
 	OutCandidates = R->Candidates;
+	bOutLanOnly   = R->bLanOnly;
 
 
 	// 방장은 뺀다. 이 신호를 보낸 당사자이고, 이미 자기 리슨서버 안에 있다.
