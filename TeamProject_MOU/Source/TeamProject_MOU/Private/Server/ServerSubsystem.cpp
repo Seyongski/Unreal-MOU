@@ -23,6 +23,8 @@
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/NetDriver.h"
+#include "SocketSubsystem.h"
+#include "IPAddress.h"
 #include "Engine/World.h"
 #include "HAL/IConsoleManager.h"
 #include "Misc/PackageName.h"
@@ -1041,6 +1043,20 @@ void UServerSubsystem::PollListenServer(float DeltaTime)
 			TEXT("리슨서버가 열렸다(%.1f초 소요). 참여자에게 출발 신호를 보낸다."),
 			ListenServerWaitSeconds);
 
+		// ★ 여기서 이 안내를 찍는 이유. (2026-08-28)
+		//
+		//   리슨서버가 떴다는 것은 **이 PC 안에서** 포트가 열렸다는 뜻일 뿐이다.
+		//   다른 네트워크의 참여자가 실제로 들어오려면 **이 PC 가 있는 네트워크의
+		//   공유기**가 그 포트를 이 PC 로 넘겨줘야 한다. 그 둘은 완전히 다른 문제인데,
+		//   화면에는 똑같이 "이동합니다" 만 뜨기 때문에 구분이 안 된다.
+		//
+		//   실제로 이것 때문에 하루를 썼다 — 서버 쪽 공유기에 포워딩을 넣어두고
+		//   "포워딩은 했다" 고 생각했지만, 참여자의 게임 트래픽은 서버를 아예
+		//   거치지 않고 방장에게 직접 온다. 열어야 할 공유기는 방장 쪽이었다.
+		//
+		//   그래서 무엇을 어디에 넣어야 하는지를 값까지 채워서 찍어둔다.
+		LogListenServerReachability();
+
 		ListenServerWaitSeconds = 0.f;
 		Backend->NotifyHostReady();
 		return;
@@ -1133,6 +1149,54 @@ void UServerSubsystem::ReleasePreloadedMap()
 {
 	PreloadedMapPackage = nullptr;
 	PreloadedMapName.Reset();
+}
+
+void UServerSubsystem::LogListenServerReachability() const
+{
+	// GetLocalAddr() 이 non-const 라 여기서도 const 를 걸지 않는다.
+	UWorld*     World     = GetGameInstance() ? GetGameInstance()->GetWorld() : nullptr;
+	UNetDriver* NetDriver = World ? World->GetNetDriver() : nullptr;
+
+	// 리슨서버가 실제로 듣고 있는 포트. 설정값(7777)을 그대로 찍으면 거짓말이 될 수 있다 —
+	// PIE 나 실행 인자로 다른 포트가 잡히는 경우가 있기 때문이다.
+	int32 ListenPort = 0;
+	if (NetDriver != nullptr)
+	{
+		const TSharedPtr<const FInternetAddr> LocalAddr = NetDriver->GetLocalAddr();
+		if (LocalAddr.IsValid())
+		{
+			ListenPort = LocalAddr->GetPort();
+		}
+	}
+
+	// 이 PC 의 LAN IP. 공유기 설정 화면의 "내부 IP 주소" 칸에 그대로 넣을 값이다.
+	FString LanIp = TEXT("<이 PC 의 LAN IP>");
+	if (ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
+	{
+		bool bCanBindAll = false;
+		const TSharedPtr<FInternetAddr> Local = Sockets->GetLocalHostAddr(*GLog, bCanBindAll);
+		if (Local.IsValid())
+		{
+			LanIp = Local->ToString(/*bAppendPort=*/false);
+		}
+	}
+
+	if (ListenPort <= 0)
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("리슨서버 포트를 확인하지 못했다. 참여자가 못 들어오면 넷드라이버 상태를 먼저 볼 것."));
+		return;
+	}
+
+	UE_LOG(LogMOUServer, Log,
+		TEXT("[방장] 리슨서버가 %s:%d 에서 듣고 있다."), *LanIp, ListenPort);
+	UE_LOG(LogMOUServer, Log,
+		TEXT("[방장] 다른 네트워크의 참여자가 들어오려면 **이 PC 의 공유기**에 다음이 있어야 한다:"));
+	UE_LOG(LogMOUServer, Log,
+		TEXT("[방장]     외부 UDP %d  ->  %s : %d"), ListenPort, *LanIp, ListenPort);
+	UE_LOG(LogMOUServer, Log,
+		TEXT("[방장] 로그인 서버 쪽 공유기에 넣은 포워딩은 이 경로와 무관하다 — ")
+		TEXT("게임 트래픽은 서버를 거치지 않고 참여자가 여기로 직접 붙는다."));
 }
 void UServerSubsystem::SetConnectionState(EChatConnectionState NewState, const FString& Detail)
 {

@@ -96,7 +96,7 @@ public:
 	 *                            흔해서 0 이 아니어도 결국 영구로 떨어질 수 있다
 	 */
 	UFUNCTION(BlueprintCallable, Category = "MOU|NAT")
-	void BeginPortMapping(int32 InternalPort = 7777, int32 DesiredExternalPort = 0, int32 LeaseSeconds = 0);
+	void BeginPortMapping(int32 InternalPort = 7777, int32 DesiredExternalPort = 0, int32 LeaseSeconds = 0, bool bForce = false);
 
 	/**
 	 * 열어둔 포트를 닫는다. 방에서 나갈 때 부른다.

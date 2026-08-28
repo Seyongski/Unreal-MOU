@@ -532,6 +532,12 @@ private:
 	/** 지금 이 프로세스가 리슨서버로 돌고 있는가. */
 	bool IsListenServerUp() const;
 
+	/**
+	 * 리슨서버가 뜬 직후, 외부 참여자가 들어오려면 무엇이 더 필요한지 로그에 남긴다.
+	 * 값(이 PC 의 LAN IP, 실제 리슨 포트)까지 채워서 그대로 공유기에 옮겨 적을 수 있게 한다.
+	 */
+	void LogListenServerReachability() const;
+
 	void SetConnectionState(EChatConnectionState NewState, const FString& Detail = FString());
 
 	/** 보관해둔 로그인 요청을 실제로 전송한다. */

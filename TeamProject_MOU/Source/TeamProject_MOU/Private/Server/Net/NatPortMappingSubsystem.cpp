@@ -3,6 +3,7 @@
 #include "HAL/RunnableThread.h"
 #include "Server/Chat/ChatTypes.h"          // LogMOUServer
 #include "Server/Net/NatMappingRunnable.h"
+#include "Server/ServerSettings.h"
 
 // ─────────────────────────────────────────────────────────────────────
 // BP enum 과 순수 C++ enum 이 어긋나면 조용히 엉뚱한 사유가 표시된다.
@@ -40,11 +41,29 @@ void UNatPortMappingSubsystem::Deinitialize()
 	Super::Deinitialize();
 }
 
-void UNatPortMappingSubsystem::BeginPortMapping(int32 InternalPort, int32 DesiredExternalPort, int32 LeaseSeconds)
+void UNatPortMappingSubsystem::BeginPortMapping(int32 InternalPort, int32 DesiredExternalPort, int32 LeaseSeconds, bool bForce)
 {
 	if (InternalPort <= 0 || InternalPort > 65535)
 	{
 		UE_LOG(LogMOUServer, Warning, TEXT("[NAT] 잘못된 포트 번호: %d"), InternalPort);
+		return;
+	}
+
+	// ★ 팀이 수동 포트포워딩으로 운영하기로 했으면 시도조차 하지 않는다. (2026-08-28)
+	//
+	//   시도해봐야 SSDP 탐색으로 최대 3초를 버리고 실패할 뿐이고, 그동안 방 만들기
+	//   창에는 "공유기에 포트를 여는 중입니다..." 가 떠 있다. 실제로는 수동
+	//   포워딩으로 잘 되는 상황인데 뭔가 잘못된 것처럼 보이게 만든다.
+	//
+	//   콘솔 명령 MOU.Nat.Open 은 bForce 로 이 판정을 건너뛴다 —
+	//   "설정과 무관하게 지금 이 공유기가 UPnP 를 지원하는지 보고 싶다" 가
+	//   그 명령의 존재 이유이기 때문이다.
+	if (!bForce && !UMOUServerSettings::ShouldUseUpnp())
+	{
+		UE_LOG(LogMOUServer, Log,
+			TEXT("[NAT] UPnP 가 꺼져 있어 포트 열기를 건너뛴다(수동 포트포워딩 운영). ")
+			TEXT("방장이 되려면 이 PC 의 공유기에 외부 UDP %d -> 이 PC 의 LAN IP:%d 가 열려 있어야 한다."),
+			InternalPort, InternalPort);
 		return;
 	}
 
@@ -249,13 +268,15 @@ namespace
 
 	FAutoConsoleCommand OpenCommand(
 		TEXT("MOU.Nat.Open"),
-		TEXT("공유기에 포트를 열어달라고 요청한다. 사용법: MOU.Nat.Open [내부포트=7777]"),
+		TEXT("공유기에 포트를 열어달라고 요청한다. 설정(bUseUpnpPortMapping)이 꺼져 있어도 강제로 시도한다. 사용법: MOU.Nat.Open [내부포트=7777]"),
 		FConsoleCommandWithArgsDelegate::CreateStatic([](const TArray<FString>& Args)
 		{
 			if (UNatPortMappingSubsystem* Subsystem = FindNatSubsystem())
 			{
 				const int32 Port = (Args.Num() > 0) ? FCString::Atoi(*Args[0]) : 7777;
-				Subsystem->BeginPortMapping(Port);
+				// 설정이 꺼져 있어도 진행한다. "이 공유기가 UPnP 를 지원하는가" 를
+				// 지금 확인하는 것이 이 명령의 존재 이유다.
+				Subsystem->BeginPortMapping(Port, 0, 0, /*bForce=*/true);
 			}
 		}));
 
