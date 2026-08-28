@@ -416,11 +416,32 @@ ENatMapResult FNatPortMapping::SendSsdpMSearch(FString& OutLocationUrl, float Ti
 		                     RequestUtf8.Length(), Sent, *Destination);
 	}
 
-	// 세 요청 중 **어느 것에든** 먼저 답한 공유기를 쓴다.
+	// ★ 응답을 받되 **아무나 받으면 안 된다.** (2026-08-28 회귀 수정)
+	//
+	//   `upnp:rootdevice` 는 LAN 의 **모든 UPnP 기기**가 답한다 — TV, 프린터,
+	//   NAS, 미디어 서버, 윈도우의 SSDP 서비스까지. 예전 순차 구조는
+	//   InternetGatewayDevice 를 **혼자 먼저** 물어봤기 때문에 공유기만 답했고,
+	//   rootdevice 는 아무도 답하지 않았을 때의 최후 수단이었다. 즉 순차 구조가
+	//   속도를 대가로 **우선순위**를 보장하고 있었다.
+	//
+	//   셋을 동시에 쏘도록 바꾸면서 그 우선순위가 사라졌다. 먼저 답한 TV 를
+	//   공유기로 착각하고, 그 기기의 설명을 받아 WANIPConnection 이 없으니
+	//   매핑이 실패한다. UPnP 기기가 없는 네트워크에서는 드러나지 않는다.
+	//
+	//   그래서 속도는 유지하되(셋을 동시에 쏜다) 판정만 되살린다:
+	//     · ST 에 InternetGatewayDevice 가 있으면 → 그것이 정답. 즉시 반환
+	//     · 아니면 → 후보로만 담아두고 공유기가 늦게 답하는지 잠깐 더 기다린다
+	//     · 끝까지 IGD 가 없으면 → 그때 후보를 쓴다 (예전 rootdevice 단계와 같다)
+	const float NonGatewayGraceSeconds = 1.0f;   // MX 가 1 이라 이 안에 다 들어온다
+
 	TArray<uint8> Buffer;
 	Buffer.SetNumUninitialized(4096);
 
-	const double Deadline = FPlatformTime::Seconds() + TimeoutSeconds;
+	FString FallbackLocation;
+
+	const double HardDeadline = FPlatformTime::Seconds() + TimeoutSeconds;
+	double       Deadline     = HardDeadline;
+
 	while (FPlatformTime::Seconds() < Deadline)
 	{
 		if (!Guard.Socket->Wait(ESocketWaitConditions::WaitForRead, FTimespan::FromMilliseconds(100)))
@@ -439,17 +460,56 @@ ENatMapResult FNatPortMapping::SendSsdpMSearch(FString& OutLocationUrl, float Ti
 
 		TArray<FString> Lines;
 		Response.ParseIntoArrayLines(Lines);
+
+		FString Location;
+		FString ResponseSt;
+
 		for (const FString& Line : Lines)
 		{
 			if (Line.StartsWith(TEXT("LOCATION:"), ESearchCase::IgnoreCase))
 			{
-				OutLocationUrl = Line.Mid(9).TrimStartAndEnd();
-				if (!OutLocationUrl.IsEmpty())
-				{
-					return ENatMapResult::Success;
-				}
+				Location = Line.Mid(9).TrimStartAndEnd();
+			}
+			else if (Line.StartsWith(TEXT("ST:"), ESearchCase::IgnoreCase))
+			{
+				ResponseSt = Line.Mid(3).TrimStartAndEnd();
 			}
 		}
+
+		if (Location.IsEmpty())
+		{
+			continue;
+		}
+
+		// 공유기가 맞다. 더 기다릴 이유가 없다.
+		if (ResponseSt.Contains(TEXT("InternetGatewayDevice"), ESearchCase::IgnoreCase))
+		{
+			UE_LOG(LogMOUServer, Log, TEXT("[NAT] 공유기 응답: %s (ST %s)"), *Location, *ResponseSt);
+			OutLocationUrl = Location;
+			return ENatMapResult::Success;
+		}
+
+		// 공유기가 아닌 기기다. 버리지는 않되(정말 공유기가 rootdevice 로만
+		// 답하는 경우가 있다) 이걸 답으로 확정하지도 않는다.
+		if (FallbackLocation.IsEmpty())
+		{
+			UE_LOG(LogMOUServer, Verbose,
+				TEXT("[NAT] 공유기가 아닌 UPnP 기기가 답했다: %s (ST %s). 공유기를 조금 더 기다린다."),
+				*Location, *ResponseSt);
+
+			FallbackLocation = Location;
+			Deadline = FMath::Min(HardDeadline,
+				FPlatformTime::Seconds() + static_cast<double>(NonGatewayGraceSeconds));
+		}
+	}
+
+	// IGD 로 답한 기기가 없었다. 예전 코드의 rootdevice 단계와 같은 자리다.
+	if (!FallbackLocation.IsEmpty())
+	{
+		UE_LOG(LogMOUServer, Log,
+			TEXT("[NAT] IGD 로 답한 기기가 없어 rootdevice 응답을 쓴다: %s"), *FallbackLocation);
+		OutLocationUrl = FallbackLocation;
+		return ENatMapResult::Success;
 	}
 
 	// 여기까지 왔으면 아무도 답하지 않았다.
