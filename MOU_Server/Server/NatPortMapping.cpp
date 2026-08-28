@@ -356,12 +356,15 @@ namespace
 			"upnp:rootdevice",
 		};
 
-		// ★ 세 개를 먼저 전부 쏘고, 그 다음에 한 번만 기다린다. (2026-08-26)
-		//   예전에는 대상마다 3초씩 따로 기다려서, UPnP 를 끈 공유기에서는
-		//   9초를 꼬박 쓴 뒤에야 실패가 났다. 서버는 그동안 accept 루프에도
-		//   들어가지 못한다. SSDP 응답은 어차피 이 소켓 하나로 비동기로
-		//   돌아오므로 요청을 직렬화할 이유가 없다.
-		//   (언리얼 쪽 NatPortMapping.cpp 에도 같은 수정이 들어가 있다)
+		// ★ 대상을 하나씩 순서대로 던진다. (2026-08-28 원복)
+		//   8/26 에 한꺼번에 쏘도록 바꿨다가, 순차 구조가 보장하던 **응답자
+		//   우선순위**가 사라져 LAN 의 아무 UPnP 기기(TV/프린터/NAS)를 공유기로
+		//   착각하는 사고가 났다. 여기서 아끼는 것은 몇 초이고 잃는 것은 접속
+		//   자체라 교환이 맞지 않는다. 대신 MX 를 1 로 줄이고 대상당 대기를
+		//   1초로 잡아 최악 3초로 맞췄다(원래는 대상당 3초 = 최악 9초).
+		//   (언리얼 쪽 NatPortMapping.cpp 에 같은 판단이 적용돼 있다)
+		constexpr int64_t kPerTargetMs = 1000;
+
 		for (const char* SearchTarget : SearchTargets)
 		{
 			char Request[512];
@@ -376,94 +379,40 @@ namespace
 
 			::sendto(Guard.Sock, Request, Length, 0,
 			         reinterpret_cast<sockaddr*>(&Destination), sizeof(Destination));
-		}
 
-		// ★ 응답을 받되 **아무나 받으면 안 된다.** (2026-08-28 회귀 수정)
-		//
-		//   upnp:rootdevice 는 LAN 의 모든 UPnP 기기가 답한다(TV, 프린터, NAS,
-		//   윈도우 SSDP 서비스). 예전 순차 구조는 IGD 를 혼자 먼저 물어봐서
-		//   공유기만 답했다 — 속도를 대가로 **우선순위**를 보장하고 있었다.
-		//   셋을 동시에 쏘면서 그 우선순위가 사라져, 먼저 답한 기기를 공유기로
-		//   착각하게 됐다. 속도는 유지하고 판정만 되살린다.
-		//   (언리얼 쪽 NatPortMapping.cpp 에 같은 수정이 들어가 있다)
-		constexpr int64_t kNonGatewayGraceMs = 1000;   // MX 가 1 이라 이 안에 다 들어온다
-
-		std::string FallbackLocation;
-
-		const int64_t HardDeadline = NowMs() + 3000;
-		int64_t       Deadline     = HardDeadline;
-
-		while (NowMs() < Deadline)
-		{
-			char        Buffer[4096];
-			sockaddr_in From{};
-			socklen_t   FromLen = sizeof(From);
-
-			const int Read = ::recvfrom(Guard.Sock, Buffer, sizeof(Buffer) - 1, 0,
-			                            reinterpret_cast<sockaddr*>(&From), &FromLen);
-			if (Read <= 0)
+			// 이 ST 에 대한 응답만 기다린다.
+			const int64_t Deadline = NowMs() + kPerTargetMs;
+			while (NowMs() < Deadline)
 			{
-				continue;   // 타임아웃. Deadline 까지 계속 기다린다
-			}
-			Buffer[Read] = '\0';
+				char        Buffer[4096];
+				sockaddr_in From{};
+				socklen_t   FromLen = sizeof(From);
 
-			const std::string Response(Buffer, static_cast<size_t>(Read));
-
-			// --- LOCATION 뽑기 ---
-			const size_t LocationPos = FindNoCase(Response, "location:");
-			if (LocationPos == std::string::npos)
-			{
-				continue;
-			}
-
-			const size_t ValueStart = LocationPos + 9;
-			const size_t LineEnd    = Response.find("\r\n", ValueStart);
-			const std::string Location = Trim(Response.substr(ValueStart,
-				(LineEnd == std::string::npos) ? std::string::npos : LineEnd - ValueStart));
-
-			if (Location.empty())
-			{
-				continue;
-			}
-
-			// --- 이 응답이 공유기의 것인가 ---
-			// ST 헤더에 InternetGatewayDevice 가 있으면 확실하다.
-			bool bIsGateway = false;
-			{
-				const size_t StPos = FindNoCase(Response, "\nst:");
-				if (StPos != std::string::npos)
+				const int Read = ::recvfrom(Guard.Sock, Buffer, sizeof(Buffer) - 1, 0,
+				                            reinterpret_cast<sockaddr*>(&From), &FromLen);
+				if (Read <= 0)
 				{
-					const size_t StValue = StPos + 4;
-					const size_t StEnd   = Response.find("\r\n", StValue);
-					const std::string St = Trim(Response.substr(StValue,
-						(StEnd == std::string::npos) ? std::string::npos : StEnd - StValue));
+					continue;   // 타임아웃. Deadline 까지 계속 기다린다
+				}
+				Buffer[Read] = '\0';
 
-					bIsGateway = FindNoCase(St, "internetgatewaydevice") != std::string::npos;
+				const std::string Response(Buffer, static_cast<size_t>(Read));
+				const size_t      LocationPos = FindNoCase(Response, "location:");
+				if (LocationPos == std::string::npos)
+				{
+					continue;
+				}
+
+				const size_t ValueStart = LocationPos + 9;
+				const size_t LineEnd    = Response.find("\r\n", ValueStart);
+				OutLocationUrl = Trim(Response.substr(ValueStart,
+					(LineEnd == std::string::npos) ? std::string::npos : LineEnd - ValueStart));
+
+				if (!OutLocationUrl.empty())
+				{
+					return EResult::Success;
 				}
 			}
-
-			if (bIsGateway)
-			{
-				OutLocationUrl = Location;
-				return EResult::Success;
-			}
-
-			// 공유기가 아닌 기기다. 버리지 않되 확정하지도 않고, 공유기가 늦게
-			// 답하는지 잠깐만 더 기다린다.
-			if (FallbackLocation.empty())
-			{
-				FallbackLocation = Location;
-
-				const int64_t Grace = NowMs() + kNonGatewayGraceMs;
-				Deadline = (Grace < HardDeadline) ? Grace : HardDeadline;
-			}
-		}
-
-		// IGD 로 답한 기기가 없었다. 예전 코드의 rootdevice 단계와 같은 자리다.
-		if (!FallbackLocation.empty())
-		{
-			OutLocationUrl = FallbackLocation;
-			return EResult::Success;
 		}
 
 		return EResult::NoGatewayFound;

@@ -388,16 +388,29 @@ ENatMapResult FNatPortMapping::SendSsdpMSearch(FString& OutLocationUrl, float Ti
 		TEXT("upnp:rootdevice"),
 	};
 
-	// ★ 세 개를 먼저 전부 쏘고, 그 다음에 한 번만 기다린다. (2026-08-26)
+	// ★ 대상을 하나씩 순서대로 던진다. (2026-08-28 원복)
 	//
-	//   예전에는 "쏘고 → TimeoutSeconds 기다리고 → 다음 것 쏘고" 를 반복했다.
-	//   그래서 UPnP 를 끈 공유기에서는 3 x 3초 = 9초를 꼬박 기다린 뒤에야
-	//   실패가 났다. 방 만들기 창이 그동안 "포트를 여는 중" 으로 멈춰 있었다.
+	//   [왜 원래대로 돌렸나]
+	//     8/26 에 "셋을 한꺼번에 쏘고 한 번만 기다린다" 로 바꿔 9초를 3초로 줄였다.
+	//     그런데 그 순차 구조는 속도를 대가로 **응답자의 우선순위**를 보장하고
+	//     있었다. upnp:rootdevice 는 LAN 의 모든 UPnP 기기(TV, 프린터, NAS,
+	//     윈도우 SSDP 서비스)가 답하는 반면, IGD 를 혼자 먼저 물어보면 공유기만
+	//     답한다. 한꺼번에 쏘면 먼저 답한 아무 기기가 공유기로 뽑힌다.
 	//
-	//   SSDP 응답은 어차피 비동기로 이 소켓 하나에 돌아온다. 요청을 직렬화할
-	//   이유가 없다 — 규격도 여러 M-SEARCH 를 연달아 보내는 것을 막지 않는다.
-	//   이렇게 바꾸면 최악이 9초에서 3초가 되고, 답하는 공유기는 첫 응답이
-	//   오는 즉시(보통 100ms 안쪽) 반환하므로 체감이 특히 크게 준다.
+	//     ST 를 보고 IGD 를 골라내는 방식으로도 고칠 수 있고 실제로 그렇게
+	//     고쳤었다. 하지만 이 경로는 **실기 검증이 어렵고**(내 PC 공유기는 UPnP 가
+	//     꺼져 있다) 이미 두 번 사고가 났다. 여기서 아낄 수 있는 것은 몇 초이고,
+	//     잃는 것은 "참여자가 아예 못 들어온다" 다. 교환 비율이 맞지 않는다.
+	//
+	//   [그래도 9초는 아니다]
+	//     원래 코드는 대상마다 3초씩 = 최악 9초였다. MX 를 1 로 줄였으므로
+	//     규격상 1초 안에 답이 온다. 대상당 대기를 1초로 잡아 최악 3초가 된다.
+	//     순서(= 정확성)는 그대로 두고 대기 시간만 줄인 것이다.
+	const float PerTargetSeconds = FMath::Min(TimeoutSeconds, 1.0f);
+
+	TArray<uint8> Buffer;
+	Buffer.SetNumUninitialized(4096);
+
 	for (const TCHAR* SearchTarget : SearchTargets)
 	{
 		// MX 는 "이 초 안에 아무 때나 답하라" 는 뜻이다. 규격상 1~5.
@@ -414,102 +427,41 @@ ENatMapResult FNatPortMapping::SendSsdpMSearch(FString& OutLocationUrl, float Ti
 		int32 Sent = 0;
 		Guard.Socket->SendTo(reinterpret_cast<const uint8*>(RequestUtf8.Get()),
 		                     RequestUtf8.Length(), Sent, *Destination);
-	}
 
-	// ★ 응답을 받되 **아무나 받으면 안 된다.** (2026-08-28 회귀 수정)
-	//
-	//   `upnp:rootdevice` 는 LAN 의 **모든 UPnP 기기**가 답한다 — TV, 프린터,
-	//   NAS, 미디어 서버, 윈도우의 SSDP 서비스까지. 예전 순차 구조는
-	//   InternetGatewayDevice 를 **혼자 먼저** 물어봤기 때문에 공유기만 답했고,
-	//   rootdevice 는 아무도 답하지 않았을 때의 최후 수단이었다. 즉 순차 구조가
-	//   속도를 대가로 **우선순위**를 보장하고 있었다.
-	//
-	//   셋을 동시에 쏘도록 바꾸면서 그 우선순위가 사라졌다. 먼저 답한 TV 를
-	//   공유기로 착각하고, 그 기기의 설명을 받아 WANIPConnection 이 없으니
-	//   매핑이 실패한다. UPnP 기기가 없는 네트워크에서는 드러나지 않는다.
-	//
-	//   그래서 속도는 유지하되(셋을 동시에 쏜다) 판정만 되살린다:
-	//     · ST 에 InternetGatewayDevice 가 있으면 → 그것이 정답. 즉시 반환
-	//     · 아니면 → 후보로만 담아두고 공유기가 늦게 답하는지 잠깐 더 기다린다
-	//     · 끝까지 IGD 가 없으면 → 그때 후보를 쓴다 (예전 rootdevice 단계와 같다)
-	const float NonGatewayGraceSeconds = 1.0f;   // MX 가 1 이라 이 안에 다 들어온다
-
-	TArray<uint8> Buffer;
-	Buffer.SetNumUninitialized(4096);
-
-	FString FallbackLocation;
-
-	const double HardDeadline = FPlatformTime::Seconds() + TimeoutSeconds;
-	double       Deadline     = HardDeadline;
-
-	while (FPlatformTime::Seconds() < Deadline)
-	{
-		if (!Guard.Socket->Wait(ESocketWaitConditions::WaitForRead, FTimespan::FromMilliseconds(100)))
+		// 이 ST 에 대한 응답만 기다린다. 공유기가 여러 대면 먼저 답한 것을 쓴다.
+		const double Deadline = FPlatformTime::Seconds() + PerTargetSeconds;
+		while (FPlatformTime::Seconds() < Deadline)
 		{
-			continue;
-		}
-
-		int32 Read = 0;
-		TSharedRef<FInternetAddr> From = Subsystem->CreateInternetAddr();
-		if (!Guard.Socket->RecvFrom(Buffer.GetData(), Buffer.Num(), Read, *From) || Read <= 0)
-		{
-			continue;
-		}
-
-		const FString Response = Utf8ToString(Buffer.GetData(), Read);
-
-		TArray<FString> Lines;
-		Response.ParseIntoArrayLines(Lines);
-
-		FString Location;
-		FString ResponseSt;
-
-		for (const FString& Line : Lines)
-		{
-			if (Line.StartsWith(TEXT("LOCATION:"), ESearchCase::IgnoreCase))
+			if (!Guard.Socket->Wait(ESocketWaitConditions::WaitForRead, FTimespan::FromMilliseconds(100)))
 			{
-				Location = Line.Mid(9).TrimStartAndEnd();
+				continue;
 			}
-			else if (Line.StartsWith(TEXT("ST:"), ESearchCase::IgnoreCase))
+
+			int32 Read = 0;
+			TSharedRef<FInternetAddr> From = Subsystem->CreateInternetAddr();
+			if (!Guard.Socket->RecvFrom(Buffer.GetData(), Buffer.Num(), Read, *From) || Read <= 0)
 			{
-				ResponseSt = Line.Mid(3).TrimStartAndEnd();
+				continue;
+			}
+
+			const FString Response = Utf8ToString(Buffer.GetData(), Read);
+
+			TArray<FString> Lines;
+			Response.ParseIntoArrayLines(Lines);
+			for (const FString& Line : Lines)
+			{
+				if (Line.StartsWith(TEXT("LOCATION:"), ESearchCase::IgnoreCase))
+				{
+					OutLocationUrl = Line.Mid(9).TrimStartAndEnd();
+					if (!OutLocationUrl.IsEmpty())
+					{
+						UE_LOG(LogMOUServer, Log,
+							TEXT("[NAT] %s 로 공유기를 찾았다: %s"), SearchTarget, *OutLocationUrl);
+						return ENatMapResult::Success;
+					}
+				}
 			}
 		}
-
-		if (Location.IsEmpty())
-		{
-			continue;
-		}
-
-		// 공유기가 맞다. 더 기다릴 이유가 없다.
-		if (ResponseSt.Contains(TEXT("InternetGatewayDevice"), ESearchCase::IgnoreCase))
-		{
-			UE_LOG(LogMOUServer, Log, TEXT("[NAT] 공유기 응답: %s (ST %s)"), *Location, *ResponseSt);
-			OutLocationUrl = Location;
-			return ENatMapResult::Success;
-		}
-
-		// 공유기가 아닌 기기다. 버리지는 않되(정말 공유기가 rootdevice 로만
-		// 답하는 경우가 있다) 이걸 답으로 확정하지도 않는다.
-		if (FallbackLocation.IsEmpty())
-		{
-			UE_LOG(LogMOUServer, Verbose,
-				TEXT("[NAT] 공유기가 아닌 UPnP 기기가 답했다: %s (ST %s). 공유기를 조금 더 기다린다."),
-				*Location, *ResponseSt);
-
-			FallbackLocation = Location;
-			Deadline = FMath::Min(HardDeadline,
-				FPlatformTime::Seconds() + static_cast<double>(NonGatewayGraceSeconds));
-		}
-	}
-
-	// IGD 로 답한 기기가 없었다. 예전 코드의 rootdevice 단계와 같은 자리다.
-	if (!FallbackLocation.IsEmpty())
-	{
-		UE_LOG(LogMOUServer, Log,
-			TEXT("[NAT] IGD 로 답한 기기가 없어 rootdevice 응답을 쓴다: %s"), *FallbackLocation);
-		OutLocationUrl = FallbackLocation;
-		return ENatMapResult::Success;
 	}
 
 	// 여기까지 왔으면 아무도 답하지 않았다.

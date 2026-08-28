@@ -41,8 +41,9 @@ UMOUServerSettings::UMOUServerSettings()
 	// 60초. 큰 맵을 저사양 PC 에서 여는 최악의 경우를 넉넉히 덮는 값이다.
 	// 정상적인 경우 이 값은 쓰이지 않는다 — 리슨서버가 뜨는 즉시 신호가 나간다.
 	, HostReadyTimeoutSeconds(60.f)
-	// 기본이 false 인 이유는 헤더 주석 참고 — 우리 팀은 수동 포트포워딩으로 간다.
-	, bUseUpnpPortMapping(false)
+	// 기본이 true 인 이유는 헤더 주석 참고 — 끄면 다른 네트워크 방장의 7777 을
+	// 아무도 열어주지 않아 참여자가 못 들어온다.
+	, bUseUpnpPortMapping(true)
 {
 }
 
