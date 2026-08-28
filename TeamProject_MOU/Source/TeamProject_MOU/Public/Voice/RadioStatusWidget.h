@@ -79,6 +79,7 @@
 class APawn;
 class ARadio;
 class UImage;
+class UWidget;
 class UProgressBar;
 class UTextBlock;
 class URadioComponent;
@@ -203,6 +204,25 @@ protected:
 	UPROPERTY(BlueprintReadOnly, meta = (BindWidgetOptional), Category = "MOU|Radio")
 	TObjectPtr<UProgressBar> BatteryBar;
 
+	/**
+	 * 무전기가 없을 때 접을 대상. WBP 의 최상위 패널에 이 이름을 주면 된다.
+	 *
+	 * ★ 왜 위젯 자신(this)을 접지 않는가 - **틱을 잃을 위험이 있어서다.**
+	 *   이 위젯은 NativeTick 에서 폴링해 "무전기가 생겼는지" 를 스스로 알아낸다.
+	 *   그런데 자기 자신을 Collapsed 로 만들면, 그 이후 틱이 도는지가 위젯이
+	 *   어느 패널에 담겼는지에 달리게 된다. 한 번이라도 안 돌면 **다시 켤 사람이
+	 *   아무도 없다** - 무전기를 주워도 영영 안 나타난다.
+	 *
+	 *   그래서 뿌리는 항상 살려두고 **내용물만** 접는다. 빈 위젯이 틱만 도는
+	 *   비용은 0.1초에 한 번 무전기를 찾는 것뿐이다.
+	 *
+	 *   지정하지 않으면 아래 개별 위젯(RadioIcon/BatteryBar/StatusText)을 각각
+	 *   접는다. WBP 에 배경 이미지처럼 따로 둔 장식이 있으면 그것까지 접히도록
+	 *   패널 하나를 ContentRoot 로 지정하는 편이 낫다.
+	 */
+	UPROPERTY(BlueprintReadOnly, meta = (BindWidgetOptional), Category = "MOU|Radio")
+	TObjectPtr<UWidget> ContentRoot;
+
 	/** WBP 에 같은 이름의 TextBlock 이 있으면 자동 연결된다. 없으면 BuildDefaultLayout 이 만든다. */
 	UPROPERTY(BlueprintReadOnly, meta = (BindWidgetOptional), Category = "MOU|Radio")
 	TObjectPtr<UTextBlock> StatusText;
@@ -221,6 +241,14 @@ private:
 
 	/** 축약된 상태를 브러시/색/가시성으로 옮긴다. */
 	void ApplyRadioState(ERadioIconState NewState);
+
+	/**
+	 * 내용물을 보이거나 접는다. **위젯 자신은 건드리지 않는다**(ContentRoot 주석의 ★).
+	 *
+	 * ContentRoot 가 지정돼 있으면 그것만, 없으면 RadioIcon/BatteryBar/StatusText 를
+	 * 각각 접는다.
+	 */
+	void SetContentVisible(bool bVisible);
 
 	/** 배터리 바를 갱신한다. 보간하지 않는다 - 배터리는 튀는 값이 아니다. */
 	void UpdateBatteryBar();

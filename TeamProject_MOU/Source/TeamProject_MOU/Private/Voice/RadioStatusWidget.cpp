@@ -14,6 +14,7 @@
 #include "Components/CanvasPanel.h"
 #include "Components/CanvasPanelSlot.h"
 #include "Components/Image.h"
+#include "Components/Widget.h"
 #include "Components/InputComponent.h"
 #include "Components/ProgressBar.h"
 #include "Components/TextBlock.h"
@@ -22,6 +23,7 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "HAL/IConsoleManager.h"
+#include "UObject/UObjectIterator.h"
 
 URadioStatusWidget::URadioStatusWidget(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -387,14 +389,20 @@ void URadioStatusWidget::ApplyRadioState(ERadioIconState NewState)
 	CachedState        = NewState;
 	bRadioStateApplied = true;
 
-	// ★ 무전기가 없으면 위젯째로 접는다. 마이크와 다르다 - 무전기를 안 가진
-	//   것은 정상 상태라 화면을 차지할 이유가 없다.
+	// ★ 무전기가 없으면 내용을 접는다. 마이크와 다르다 - 무전기를 안 가진 것은
+	//   정상 상태라 화면을 차지할 이유가 없다.
 	//   bHideWhenNoRadio 를 끄면 "무전기 없음" 글자가 그대로 보인다(테스트용).
+	//
+	// ★★ **위젯 자신(this)은 절대 접지 않는다.** 접는 것은 내용물뿐이다.
+	//   이 위젯은 NativeTick 폴링으로 "무전기가 생겼는지" 를 스스로 알아내는데,
+	//   자기 자신을 Collapsed 로 만들면 그 이후로 틱이 계속 도는지가 위젯이 담긴
+	//   패널의 구현에 달리게 된다. 한 번이라도 안 돌면 **다시 켤 사람이 아무도
+	//   없다** - 무전기를 주워도 영영 안 나타난다.
+	//   빈 위젯이 틱만 도는 비용은 0.1초에 한 번 무전기를 찾는 것뿐이라, 이
+	//   위험을 감수할 이유가 전혀 없다.
 	if (bHideWhenNoRadio)
 	{
-		SetVisibility(NewState == ERadioIconState::None
-			? ESlateVisibility::Collapsed
-			: ESlateVisibility::HitTestInvisible);
+		SetContentVisible(NewState != ERadioIconState::None);
 	}
 
 	if (RadioIcon != nullptr)
@@ -410,6 +418,44 @@ void URadioStatusWidget::ApplyRadioState(ERadioIconState NewState)
 	}
 
 	OnRadioStateChanged(NewState, OldState);
+}
+
+void URadioStatusWidget::SetContentVisible(bool bVisible)
+{
+	const ESlateVisibility Wanted = bVisible
+		? ESlateVisibility::SelfHitTestInvisible
+		: ESlateVisibility::Collapsed;
+
+	// ContentRoot 를 지정했으면 그것 하나만 접는다. WBP 에 배경처럼 따로 둔
+	// 장식까지 같이 접히므로 이쪽이 낫다.
+	if (ContentRoot != nullptr)
+	{
+		ContentRoot->SetVisibility(Wanted);
+		return;
+	}
+
+	// 안 지정했으면 아는 것만 각각 접는다.
+	if (RadioIcon != nullptr)
+	{
+		RadioIcon->SetVisibility(Wanted);
+	}
+	if (BatteryBar != nullptr)
+	{
+		// 배터리 바는 UpdateBatteryBar 가 따로 접기도 한다(테스트 무전기).
+		// 여기서는 켤 때만 손대고, 끄는 것은 그쪽 판단을 덮어쓰지 않는다.
+		if (bVisible)
+		{
+			BatteryBar->SetVisibility(Wanted);
+		}
+		else
+		{
+			BatteryBar->SetVisibility(ESlateVisibility::Collapsed);
+		}
+	}
+	if (StatusText != nullptr)
+	{
+		StatusText->SetVisibility(Wanted);
+	}
 }
 
 // ---------------------------------------------------------------------------
@@ -711,5 +757,230 @@ namespace
 						TEXT("무전기 UI 를 띄웠다. Z = 전원, X 홀드 = 송신. ")
 						TEXT("무전기가 없으면 MOU.Voice.Radio.Spawn 으로 먼저 들 것."));
 				}
+			}));
+}
+
+// ---------------------------------------------------------------------------
+// MOU.Voice.RadioDebug — "무전기를 주웠는데 UI 가 안 나온다" 전용 진단
+//
+// [왜 필요한가]
+//   이 UI 가 안 뜨는 경로가 **두 갈래**인데 화면상 증상이 똑같다:
+//
+//     (가) 위젯이 아예 안 만들어졌다        -> 아무것도 안 보인다
+//     (나) 위젯은 있는데 무전기를 못 찾았다 -> 내용이 접혀서 안 보인다
+//
+//   둘을 눈으로 구분할 방법이 없어서, 어느 쪽인지 모른 채 양쪽을 다 뒤지게 된다.
+//   (나) 라면 다시 두 갈래다 - 무전기가 폰에 부착이 안 된 것인지, 부착은 됐는데
+//   URadioComponent 가 없는 것(= 그 아이템이 ARadio 계열이 아님)인지.
+//
+//   MOU.Voice.HearTest 를 만든 것과 같은 이유다: 같은 증상에 원인이 여럿이면
+//   **원인을 갈라주는 도구**부터 만드는 것이 결국 빠르다.
+// ---------------------------------------------------------------------------
+
+namespace
+{
+	const TCHAR* RadioStateName(ERadioIconState State)
+	{
+		switch (State)
+		{
+		case ERadioIconState::None:         return TEXT("None(무전기 없음)");
+		case ERadioIconState::Off:          return TEXT("Off(전원 꺼짐)");
+		case ERadioIconState::On:           return TEXT("On(전원 켜짐)");
+		case ERadioIconState::Transmitting: return TEXT("Transmitting(송신 중)");
+		case ERadioIconState::Receiving:    return TEXT("Receiving(수신 중)");
+		default:                            return TEXT("(알 수 없음)");
+		}
+	}
+
+	const TCHAR* VisibilityName(ESlateVisibility Visibility)
+	{
+		switch (Visibility)
+		{
+		case ESlateVisibility::Visible:               return TEXT("Visible");
+		case ESlateVisibility::Collapsed:             return TEXT("Collapsed(접힘)");
+		case ESlateVisibility::Hidden:                return TEXT("Hidden(숨김)");
+		case ESlateVisibility::HitTestInvisible:      return TEXT("HitTestInvisible");
+		case ESlateVisibility::SelfHitTestInvisible:  return TEXT("SelfHitTestInvisible");
+		default:                                      return TEXT("(알 수 없음)");
+		}
+	}
+
+	/** 부착 부모를 타고 올라가며 경로를 만든다. URadioComponent::GetHolder 와 같은 방향. */
+	FString DescribeAttachChain(const AActor* Actor)
+	{
+		if (Actor == nullptr)
+		{
+			return TEXT("(없음)");
+		}
+
+		FString Chain;
+		int32 Depth = 0;
+
+		for (const AActor* Current = Actor->GetAttachParentActor();
+			Current != nullptr && Depth < 8;
+			Current = Current->GetAttachParentActor(), ++Depth)
+		{
+			Chain += FString::Printf(TEXT(" -> %s"), *Current->GetName());
+		}
+
+		return Chain.IsEmpty() ? TEXT("(아무것에도 안 붙어 있다)") : Chain;
+	}
+
+	FAutoConsoleCommandWithWorldAndArgs GRadioDebugCommand(
+		TEXT("MOU.Voice.RadioDebug"),
+		TEXT("무전기 UI 가 안 뜨는 이유를 진단한다. 위젯 상태 / 폰에 부착된 액터 / ")
+		TEXT("월드의 모든 무전기를 한 번에 덤프한다."),
+		FConsoleCommandWithWorldAndArgsDelegate::CreateLambda(
+			[](const TArray<FString>& /*Args*/, UWorld* World)
+			{
+				if (World == nullptr)
+				{
+					return;
+				}
+
+				UE_LOG(LogMOUVoice, Log, TEXT("=============== 무전기 UI 진단 ==============="));
+
+				// --- 1. 위젯이 살아 있는가 ------------------------------------
+				//
+				// 여기가 "없음" 이면 (가) 다. 아래는 볼 것도 없다.
+				URadioStatusWidget* Widget = FindDebugRadioStatusWidget(World);
+
+				if (Widget == nullptr)
+				{
+					UE_LOG(LogMOUVoice, Warning,
+						TEXT("[위젯] 화면에 없다. 이것이 원인이다.\n")
+						TEXT("       확인할 것 3가지:\n")
+						TEXT("        1) PlayerController 가 ATeamProject_MOUPlayerController 를 상속하는가\n")
+						TEXT("        2) 그 BP 의 MOU|Voice 에서 bAutoShowVoiceWidgets 가 켜져 있는가\n")
+						TEXT("        3) RadioStatusWidgetClass 에 넣은 WBP 가 URadioStatusWidget 을 상속하는가\n")
+						TEXT("           (다른 부모를 쓰면 CreateWidget 이 null 을 돌려주고 조용히 넘어간다)\n")
+						TEXT("       급하면 MOU.Voice.RadioUI 로 C++ 기본 위젯을 띄워 나머지를 먼저 확인할 수 있다."));
+				}
+				else
+				{
+					UE_LOG(LogMOUVoice, Log,
+						TEXT("[위젯] 있음. 클래스=%s  상태=%s  가시성=%s"),
+						*Widget->GetClass()->GetName(),
+						RadioStateName(Widget->GetRadioState()),
+						VisibilityName(Widget->GetVisibility()));
+				}
+
+				// --- 2. 로컬 폰 -----------------------------------------------
+				APlayerController* PC   = World->GetFirstPlayerController();
+				APawn*             Pawn = PC ? PC->GetPawn() : nullptr;
+
+				if (Pawn == nullptr)
+				{
+					UE_LOG(LogMOUVoice, Warning,
+						TEXT("[폰] 없다. 아직 빙의 전이면 정상이지만, 이 상태에서는 무전기를 찾을 수 없다."));
+					UE_LOG(LogMOUVoice, Log, TEXT("=============================================="));
+					return;
+				}
+
+				UE_LOG(LogMOUVoice, Log, TEXT("[폰] %s"), *Pawn->GetName());
+
+				// --- 3. 폰에 부착된 액터 --------------------------------------
+				//
+				// ★ 이 UI 는 부착 관계로만 무전기를 찾는다(FindLocalRadioComponent).
+				//   그래서 여기 안 보이면 UI 도 못 본다. 줍기가 부착까지 했는지,
+				//   그 부착이 이 클라이언트까지 복제됐는지가 여기서 갈린다.
+				TArray<AActor*> Attached;
+				Pawn->GetAttachedActors(Attached, /*bResetArray=*/true, /*bRecursivelyIncludeAttachedActors=*/true);
+
+				UE_LOG(LogMOUVoice, Log, TEXT("[폰에 부착된 액터] %d 개"), Attached.Num());
+
+				for (const AActor* Actor : Attached)
+				{
+					if (!IsValid(Actor))
+					{
+						continue;
+					}
+
+					const bool bHasRadio = Actor->FindComponentByClass<URadioComponent>() != nullptr;
+
+					UE_LOG(LogMOUVoice, Log, TEXT("   - %s  (%s)  RadioComponent=%s"),
+						*Actor->GetName(),
+						*Actor->GetClass()->GetName(),
+						bHasRadio ? TEXT("있음  <-- 이것이 무전기다") : TEXT("없음"));
+				}
+
+				// --- 4. 월드의 모든 무전기 ------------------------------------
+				//
+				// 부착 목록에 없었다면, 무전기가 애초에 없는 것인지 아니면 있는데
+				// 안 붙은 것인지를 여기서 가른다. 둘은 대응이 완전히 다르다.
+				int32 RadioCount = 0;
+
+				for (TObjectIterator<URadioComponent> It; It; ++It)
+				{
+					URadioComponent* Comp = *It;
+
+					if (!IsValid(Comp) || Comp->GetWorld() != World)
+					{
+						continue;
+					}
+
+					AActor* Owner = Comp->GetOwner();
+
+					if (!IsValid(Owner))
+					{
+						continue;
+					}
+
+					++RadioCount;
+
+					UE_LOG(LogMOUVoice, Log,
+						TEXT("   - %s (%s)  전원=%s  손에듦=%s\n")
+						TEXT("     부착 경로: %s%s"),
+						*Owner->GetName(),
+						*Owner->GetClass()->GetName(),
+						Comp->IsPoweredOn() ? TEXT("ON") : TEXT("OFF"),
+						Comp->IsInHand()    ? TEXT("예") : TEXT("아니오"),
+						*Owner->GetName(),
+						*DescribeAttachChain(Owner));
+				}
+
+				UE_LOG(LogMOUVoice, Log, TEXT("[월드의 무전기] %d 개"), RadioCount);
+
+				// --- 5. 결론 --------------------------------------------------
+				//
+				// 사람이 읽고 바로 다음 행동을 정할 수 있게 한 줄로 못 박는다.
+				// "정보만 던지고 해석은 알아서" 는 진단 도구가 아니다.
+				const bool bFoundOnPawn = [&Attached]()
+				{
+					for (const AActor* Actor : Attached)
+					{
+						if (IsValid(Actor) && Actor->FindComponentByClass<URadioComponent>() != nullptr)
+						{
+							return true;
+						}
+					}
+					return false;
+				}();
+
+				if (bFoundOnPawn)
+				{
+					UE_LOG(LogMOUVoice, Log,
+						TEXT("[결론] 무전기를 폰에서 찾았다. UI 가 여전히 안 보이면 위젯 쪽 문제다 - ")
+						TEXT("WBP 의 RadioIcon 브러시(IconBrushes)가 비어 있거나, 아이콘이 화면 밖에 있거나, ")
+						TEXT("ContentRoot 로 지정한 패널이 다른 곳에서 접혀 있는지 볼 것."));
+				}
+				else if (RadioCount > 0)
+				{
+					UE_LOG(LogMOUVoice, Warning,
+						TEXT("[결론] ★ 월드에 무전기는 있는데 **폰에 부착돼 있지 않다.** 이것이 원인이다.\n")
+						TEXT("       이 UI 는 부착 관계로만 무전기를 찾는다(ARadio::FindCarriedBy 와 같은 방식).\n")
+						TEXT("       위 '부착 경로' 를 볼 것 - 폰 이름이 안 나오면 줍기가 부착을 안 했거나,\n")
+						TEXT("       서버에서만 부착되고 이 클라이언트로 복제되지 않은 것이다."));
+				}
+				else
+				{
+					UE_LOG(LogMOUVoice, Warning,
+						TEXT("[결론] ★ 월드에 URadioComponent 가 하나도 없다. **주운 그 아이템이 무전기가 아니다.**\n")
+						TEXT("       배치한 액터가 ARadio 를 상속하는지 확인할 것. 이름이 무전기여도\n")
+						TEXT("       ARadio 계열이 아니면 이 UI 는 영원히 안 뜬다.\n")
+						TEXT("       테스트용 무전기는 MOU.Voice.Radio.Spawn 으로 바로 들 수 있다."));
+				}
+
+				UE_LOG(LogMOUVoice, Log, TEXT("=============================================="));
 			}));
 }

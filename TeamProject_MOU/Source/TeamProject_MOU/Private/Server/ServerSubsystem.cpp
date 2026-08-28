@@ -26,6 +26,8 @@
 #include "SocketSubsystem.h"
 #include "IPAddress.h"
 #include "Engine/World.h"
+#include "GameFramework/PlayerController.h"   // ClientTravel (참여자 여행)
+#include "Kismet/GameplayStatics.h"           // OpenLevel (방장 여행)
 #include "HAL/IConsoleManager.h"
 #include "Misc/PackageName.h"
 #include "UObject/Package.h"
@@ -644,6 +646,16 @@ void UServerSubsystem::ClearRoomState()
 	// "준비됐다" 가 나가고 서버가 NotStarted 로 거절한다.
 	bWaitingForListenServer = false;
 	ListenServerWaitSeconds = 0.f;
+
+	// 참여자 쪽도 같은 이유로 지운다. 안 지우면 방을 나간 뒤에도 타이머가 돌아
+	// 엉뚱한 화면에 "방장의 서버가 열리지 않았습니다" 가 뜬다.
+	bGuestWaitingForHostReady = false;
+	GuestWaitSeconds          = 0.f;
+
+	// ★ 받아둔 출발 신호도 버린다. 남겨두면 다음 방에서 TravelToHost 가
+	//   지난 방의 주소로 떠난다.
+	PendingHostReady = FMOURoomJoinResult();
+	TravelRoomPassword.Reset();
 }
 
 void UServerSubsystem::UpdateRoomState(int32 RoomId, int32 CurrentPlayers, bool bInGame)
@@ -674,9 +686,10 @@ bool UServerSubsystem::Tick(float DeltaTime)
 		return true;   // false 를 돌려주면 틱이 영구 해제된다. 항상 true
 	}
 
-	// 0) 방장이면 내 리슨서버가 떴는지 확인한다.
+	// 0) 방장이면 내 리슨서버가 떴는지, 참여자면 너무 오래 기다리지 않는지 확인한다.
 	//    사건 처리보다 먼저 하는 이유는 없다. 서로 독립적이다.
 	PollListenServer(DeltaTime);
+	PollGuestHostReadyTimeout(DeltaTime);
 
 	// 1) 상태 변화 처리
 	FServerClientEvent Event;
@@ -841,17 +854,52 @@ bool UServerSubsystem::Tick(float DeltaTime)
 				bWaitingForListenServer = true;
 				ListenServerWaitSeconds = 0.f;
 			}
+			else
+			{
+				// 참여자는 지금부터 출발 신호를 기다린다. 끝없이 기다리지는 않는다.
+				bGuestWaitingForHostReady = true;
+				GuestWaitSeconds          = 0.f;
+				PendingHostReady          = FMOURoomJoinResult();   // 지난 판의 값이 남아 있으면 안 된다
+			}
 
+			// ★ UI 보다 먼저 브로드캐스트하지 않는다. 위젯이 안내 문구를 띄우고
+			//   BP 훅이 돌 기회를 준 뒤에 실제 행동을 한다 — OpenLevel 이 시작되면
+			//   위젯은 곧 파괴되므로 순서를 뒤집으면 안내가 화면에 안 뜬다.
 			OnRoomGameStarted.Broadcast(Event.Join, bIsHost);
+
+			if (bIsHost)
+			{
+				TravelAsHost();
+			}
+			else if (bPreloadMapWhileWaiting)
+			{
+				// 참여자는 방장이 맵을 여는 동안 놀고 있다. 그 시간에 미리 올리면
+				// 두 로딩이 겹쳐져 실제 대기 시간이 크게 준다.
+				BeginPreloadMap(HostMapName);
+			}
 			break;
 		}
 
 		case EServerClientEventType::RoomHostReady:
+		{
 			// 참여자에게만 온다. 이제 붙어도 된다.
 			UE_LOG(LogMOUServer, Log, TEXT("방 #%d 호스트 준비 완료. %s:%d 로 이동한다."),
 				Event.RoomId, *Event.Join.HostAddress, Event.Join.HostPort);
+
+			// ★ 브로드캐스트하고 버리지 않는다. 이 순간 로비 위젯이 이미 닫혀 있으면
+			//   예전에는 정보가 통째로 사라져서 참여자가 영영 못 떠났다.
+			PendingHostReady          = Event.Join;
+			bGuestWaitingForHostReady = false;
+			GuestWaitSeconds          = 0.f;
+
 			OnRoomHostReady.Broadcast(Event.Join);
+
+			if (bAutoTravelOnGameStart)
+			{
+				TravelToHost();
+			}
 			break;
+		}
 
 		case EServerClientEventType::Disconnected:
 			LoginResult = FChatLoginResult();
@@ -1098,6 +1146,123 @@ void UServerSubsystem::PollListenServer(float DeltaTime)
 	}
 }
 
+
+void UServerSubsystem::PollGuestHostReadyTimeout(float DeltaTime)
+{
+	if (!bGuestWaitingForHostReady)
+	{
+		return;
+	}
+
+	GuestWaitSeconds += DeltaTime;
+
+	// 방장 쪽 상한에 여유를 더한다. 방장이 제 시간에 열면 그 즉시 신호가 오므로
+	// 이 값은 "대기 시간" 이 아니라 "이보다 오래면 뭔가 잘못된 것" 의 경계다.
+	// 여유가 없으면 방장이 상한 직전에 성공했을 때 참여자가 먼저 포기해버린다.
+	const float Timeout = UMOUServerSettings::GetHostReadyTimeoutSeconds() + 10.f;
+	if (GuestWaitSeconds < Timeout)
+	{
+		return;
+	}
+
+	bGuestWaitingForHostReady = false;
+	GuestWaitSeconds          = 0.f;
+
+	// ★ 여기가 없으면 화면이 "방장이 서버를 여는 중입니다..." 로 영원히 굳는다.
+	//   서버는 죽은 주소로 보내지 않으려고 일부러 신호를 안 보내는데(정당한 판단이다),
+	//   그 침묵이 참여자에게는 무한 로딩과 구분되지 않는다. 침묵도 결과다.
+	const FString Reason = FString::Printf(
+		TEXT("%.0f초 안에 방장의 서버가 열리지 않았습니다.\n")
+		TEXT("방장이 게임을 다시 시작하면 자동으로 이동합니다."),
+		Timeout);
+
+	UE_LOG(LogMOUServer, Warning, TEXT("[참여자] %s"), *Reason);
+	OnTravelFailed.Broadcast(Reason);
+}
+
+// ---------------------------------------------------------------------------
+// 여행 (2026-08-29: ULobbyWidgetBase 에서 옮겨왔다)
+//
+// 옮긴 이유는 헤더의 ConfigureTravel 위 주석에 적어뒀다. 요약하면
+// "출발 신호를 받는 주체가 위젯이면, 위젯이 닫히는 순간 아무도 안 떠난다".
+// ---------------------------------------------------------------------------
+
+void UServerSubsystem::ConfigureTravel(const FString& InHostMapName, bool bInAutoTravel, bool bInPreloadMap)
+{
+	HostMapName             = InHostMapName;
+	bAutoTravelOnGameStart  = bInAutoTravel;
+	bPreloadMapWhileWaiting = bInPreloadMap;
+
+	UE_LOG(LogMOUServer, Verbose,
+		TEXT("여행 설정: 맵='%s' 자동이동=%s 미리올리기=%s"),
+		*HostMapName,
+		bAutoTravelOnGameStart ? TEXT("O") : TEXT("X"),
+		bPreloadMapWhileWaiting ? TEXT("O") : TEXT("X"));
+}
+
+void UServerSubsystem::SetRoomPassword(const FString& InRoomPassword)
+{
+	// 빈 값도 받는다 — 공개방으로 바뀌는 것이 정상적인 경우다.
+	TravelRoomPassword = IsValidRoomPassword(InRoomPassword) ? InRoomPassword : FString();
+}
+
+void UServerSubsystem::TravelAsHost()
+{
+	if (HostMapName.IsEmpty())
+	{
+		// 맵을 정하지 않았다면 여행은 게임 쪽(블루프린트/게임모드)의 몫이다.
+		UE_LOG(LogMOUServer, Log,
+			TEXT("게임 시작됨. HostMapName 이 비어 있어 레벨은 열지 않는다 — BP 가 연다면 정상이다."));
+		return;
+	}
+
+	UGameInstance* GI = GetGameInstance();
+	if (GI == nullptr)
+	{
+		return;
+	}
+
+	// listen 옵션이 있어야 이 클라이언트가 리슨서버가 된다.
+	// RoomPassword 를 URL 에 같이 실어야 새 레벨의 GameMode 가 InitGame 에서
+	// 그 값을 읽어 보관하고, 나중에 PreLogin 에서 참여자를 검사할 수 있다.
+	FString Options = TEXT("listen");
+	if (!TravelRoomPassword.IsEmpty())
+	{
+		Options += FString::Printf(TEXT("?RoomPassword=%s"), *TravelRoomPassword);
+	}
+
+	UE_LOG(LogMOUServer, Log, TEXT("[방장] 리슨서버로 '%s' 를 연다."), *HostMapName);
+	UGameplayStatics::OpenLevel(GI, FName(*HostMapName), /*bAbsolute=*/true, Options);
+}
+
+bool UServerSubsystem::TravelToHost()
+{
+	if (!PendingHostReady.bSuccess)
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("[참여자] 아직 출발 신호를 못 받았다. 이동하지 않는다."));
+		return false;
+	}
+
+	UGameInstance* GI = GetGameInstance();
+	APlayerController* PC = GI ? GI->GetFirstLocalPlayerController() : nullptr;
+	if (PC == nullptr)
+	{
+		// ★ 위젯의 GetOwningPlayer() 를 쓰지 않는 이유가 이것이다.
+		//   위젯이 없어도 여행은 되어야 한다. GameInstance 는 늘 살아 있다.
+		UE_LOG(LogMOUServer, Error,
+			TEXT("[참여자] 로컬 플레이어 컨트롤러가 없어 이동할 수 없다."));
+		return false;
+	}
+
+	// 어디로 떠나는지 남겨둔다. 접속에 실패하면 그 주소를 그대로 넣어
+	// "어디에 못 붙었는지" 를 말해줄 수 있다.
+	NotifyTravelingTo(PendingHostReady.HostAddress, PendingHostReady.HostPort);
+
+	// MakeTravelURL 이 "IP:포트?RoomPassword=1234" 를 만들어준다.
+	PC->ClientTravel(PendingHostReady.MakeTravelURL(TravelRoomPassword), ETravelType::TRAVEL_Absolute);
+	return true;
+}
 
 // ---------------------------------------------------------------------------
 // 맵 미리 올리기 (2026-08-26)

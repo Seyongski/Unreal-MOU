@@ -100,6 +100,16 @@ void ULobbyWidgetBase::NativeConstruct()
 		}
 	}
 
+	// ★ 여행 설정을 서브시스템에 넘긴다. (2026-08-29)
+	//   값의 주인은 여전히 이 WBP 다(디자이너가 여기서 고친다). 다만 실제로 떠나는
+	//   일은 서브시스템이 한다 — 이 위젯은 게임이 시작되면 닫힐 수 있고, 그러면
+	//   출발 신호를 받을 사람이 사라지기 때문이다.
+	//   여기서 넘겨두면 위젯이 죽어도 설정은 남는다.
+	if (UServerSubsystem* Chat = GetServerSubsystem())
+	{
+		Chat->ConfigureTravel(HostMapName, bAutoTravelOnGameStart, bPreloadMapWhileWaiting);
+	}
+
 	// 서브시스템은 레벨을 넘어가도 살아있으므로, 이 위젯이 새로 만들어졌을 때
 	// 이미 방 안일 수 있다. 지금 상태를 물어보고 거기에 맞춰 연다.
 	if (const UServerSubsystem* Chat = GetServerSubsystem())
@@ -606,40 +616,25 @@ void ULobbyWidgetBase::HandleGameStarted(const FMOURoomJoinResult& Host, bool bI
 
 	OnGameStarted(Host, bIsHost, RoomPassword);
 
-	// 참여자는 여기서부터 2박자까지 놀고 있다. 그 시간에 맵을 미리 올려두면
-	// 두 번의 로딩이 겹쳐져서 실제 대기 시간이 크게 준다.
-	if (!bIsHost)
-	{
-		BeginPreloadHostMap();
-	}
-
-	if (bIsHost)
-	{
-		// 참여자에게 갈 출발 신호는 이 위젯이 보내지 않는다.
-		// OpenLevel 이 시작되면 이 위젯은 곧 파괴되기 때문이다.
-		// 리슨서버가 실제로 뜬 것을 확인하고 알리는 일은 UServerSubsystem 이 맡는다.
-		TravelAsHost();
-	}
-	// 참여자는 여기서 아무것도 하지 않는다. HandleHostReady 를 기다린다.
+	// ★ 여기서 더 이상 여행하지 않는다. (2026-08-29)
+	//   방장의 OpenLevel 도, 참여자의 맵 미리 올리기도 전부 UServerSubsystem 이
+	//   이 델리게이트를 쏜 직후에 이어서 한다. 이 위젯은 안내만 한다.
+	//   자세한 이유는 UServerSubsystem::ConfigureTravel 위 주석 참고.
 }
 
 void ULobbyWidgetBase::HandleHostReady(const FMOURoomJoinResult& Host)
 {
-	// 방장에게는 이 신호가 오지 않는다. 와도 이미 자기 맵에 있으므로 할 일이 없다.
-	if (UIState != EMOULobbyUIState::WaitingRoom)
-	{
-		return;
-	}
-
+	// ★ 예전에는 여기에 "대기실이 아니면 return" 이 있었다. 지웠다. (2026-08-29)
+	//   그 조건 때문에, 게임 시작과 함께 화면이 바뀌어 UIState 가 달라진 참여자는
+	//   출발 신호를 받고도 조용히 무시했다. 이제 떠나는 일은 서브시스템이 하므로
+	//   이 함수가 무엇을 하든 이동은 보장된다. 여기서는 안내만 한다.
 	SetMessage(FString::Printf(TEXT("호스트 %s:%d 로 이동합니다..."),
 		*Host.HostAddress, Host.HostPort), false);
 
 	OnHostReady(Host, JoinedRoomPassword);
 
-	if (bAutoTravelOnGameStart)
-	{
-		TravelAsClient(Host, JoinedRoomPassword);
-	}
+	// ClientTravel 은 UServerSubsystem::TravelToHost 가 한다.
+	// bAutoTravelOnGameStart 를 껐다면 BP 가 원하는 시점에 그 함수를 부르면 된다.
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +745,13 @@ void ULobbyWidgetBase::HandleRoomCreateFinished(int32 RoomId, const FString& Roo
 	RoomCreateWidget = nullptr;
 	MyRoomPassword   = RoomPassword;
 
+	// ★ 서브시스템에도 넘긴다. 리슨서버 URL 에 실릴 값이고, 그 일을 하는 시점에는
+	//   이 위젯이 이미 사라졌을 수 있다.
+	if (UServerSubsystem* Chat = GetServerSubsystem())
+	{
+		Chat->SetRoomPassword(RoomPassword);
+	}
+
 	EnterWaitingRoom(RoomId, /*bIsHost=*/true);
 	SetMessage(TEXT("방을 열었습니다. 참여자가 모두 준비하면 시작할 수 있습니다."), false);
 }
@@ -765,6 +767,13 @@ void ULobbyWidgetBase::HandleRoomJoinApproved(const FMOURoomJoinResult& Result, 
 	RoomListWidget     = nullptr;
 	JoinedRoomPassword = RoomPassword;
 
+	// ★ 방장 쪽과 같은 이유. ClientTravel URL 에 실릴 값인데, 그때 이 위젯이
+	//   남아 있으리라는 보장이 없다.
+	if (UServerSubsystem* Chat = GetServerSubsystem())
+	{
+		Chat->SetRoomPassword(RoomPassword);
+	}
+
 	EnterWaitingRoom(Result.RoomId, /*bIsHost=*/false);
 	SetMessage(TEXT("방에 들어왔습니다. 준비를 누르면 방장이 시작할 수 있습니다."), false);
 }
@@ -776,33 +785,16 @@ void ULobbyWidgetBase::HandleRoomListClosed()
 }
 
 // ---------------------------------------------------------------------------
-// 여행
+// 여행 실패 안내
 //
 // 여기서부터가 로비 서버의 관할 밖이다. 방 목록은 "주소록" 일 뿐이고,
 // 실제 게임 트래픽은 참여자가 호스트의 리슨서버에 직접 붙어서 오간다.
+//
+// ★ 실제로 떠나는 코드는 2026-08-29 에 UServerSubsystem 으로 옮겼다.
+//   위젯은 레벨 이동과 함께 파괴되므로, 여기서 출발 신호를 기다리면
+//   게임 시작 시 위젯을 닫는 순간 아무도 안 떠난다.
+//   이 파일에는 "사용자에게 무엇을 보여줄 것인가" 만 남는다.
 // ---------------------------------------------------------------------------
-
-void ULobbyWidgetBase::TravelAsHost()
-{
-	if (HostMapName.IsEmpty())
-	{
-		// 맵을 정하지 않았다면 여행은 게임 쪽(블루프린트/게임모드)의 몫이다.
-		SetMessage(TEXT("게임 시작됨. (HostMapName 이 비어 있어 레벨은 열지 않았습니다)"), false);
-		return;
-	}
-
-	// listen 옵션이 있어야 이 클라이언트가 리슨서버가 된다.
-	// RoomPassword 를 URL 에 같이 실어야 새 레벨의 GameMode 가 InitGame 에서
-	// 그 값을 읽어 보관하고, 나중에 PreLogin 에서 참여자를 검사할 수 있다.
-	FString Options = TEXT("listen");
-	if (!MyRoomPassword.IsEmpty())
-	{
-		Options += FString::Printf(TEXT("?RoomPassword=%s"), *MyRoomPassword);
-	}
-
-	UGameplayStatics::OpenLevel(this, FName(*HostMapName), /*bAbsolute=*/true, Options);
-}
-
 
 void ULobbyWidgetBase::HandleTravelFailed(const FString& Reason)
 {
@@ -814,41 +806,6 @@ void ULobbyWidgetBase::HandleTravelFailed(const FString& Reason)
 	// 방 자체는 서버에 살아 있으니 메인메뉴로 쫓아내지는 않는다 —
 	// 방장이 포워딩을 고치고 다시 시작하면 그대로 다시 붙을 수 있다.
 	RefreshUI();
-}
-void ULobbyWidgetBase::TravelAsClient(const FMOURoomJoinResult& Host, const FString& RoomPassword)
-{
-	APlayerController* PC = GetOwningPlayer();
-	if (PC == nullptr)
-	{
-		return;
-	}
-
-	// 어디로 떠나는지 서브시스템에 남겨둔다. 접속에 실패하면 그 주소를 그대로
-	// 넣어 "어디에 못 붙었는지" 를 말해줄 수 있다 — 실패가 조용하면 원인을
-	// 찾을 수 없다는 것을 이미 며칠에 걸쳐 배웠다.
-	if (UServerSubsystem* Server = GetServerSubsystem())
-	{
-		Server->NotifyTravelingTo(Host.HostAddress, Host.HostPort);
-	}
-
-	// MakeTravelURL 이 "IP:포트?RoomPassword=1234" 를 만들어준다.
-	PC->ClientTravel(Host.MakeTravelURL(RoomPassword), ETravelType::TRAVEL_Absolute);
-}
-
-void ULobbyWidgetBase::BeginPreloadHostMap()
-{
-	if (!bPreloadMapWhileWaiting || HostMapName.IsEmpty())
-	{
-		return;
-	}
-
-	// 실제 로딩과 참조 보관은 서브시스템이 한다. 이 위젯은 ClientTravel 이
-	// 시작되면 월드와 함께 파괴되므로, 위젯이 패키지를 들고 있으면 정작
-	// 로드가 시작되는 순간 참조가 끊겨 미리 올린 것이 헛수고가 된다.
-	if (UServerSubsystem* Server = GetServerSubsystem())
-	{
-		Server->BeginPreloadMap(HostMapName);
-	}
 }
 
 // ---------------------------------------------------------------------------

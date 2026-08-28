@@ -1,4 +1,4 @@
-// Copyright Epic Games, Inc. All Rights Reserved.
+﻿// Copyright Epic Games, Inc. All Rights Reserved.
 
 
 #include "TeamProject_MOUPlayerController.h"
@@ -60,6 +60,12 @@ void ATeamProject_MOUPlayerController::BeginPlay()
 	ShowVoiceWidgetsIfNeeded();
 }
 
+bool ATeamProject_MOUPlayerController::ShouldUseTouchControls() const
+{
+	// are we on a mobile platform? Should we force touch?
+	return SVirtualJoystick::ShouldDisplayTouchInterface() || bForceTouchControls;
+}
+
 void ATeamProject_MOUPlayerController::SetupInputComponent()
 {
 	Super::SetupInputComponent();
@@ -85,12 +91,6 @@ void ATeamProject_MOUPlayerController::SetupInputComponent()
 			}
 		}
 	}
-}
-
-bool ATeamProject_MOUPlayerController::ShouldUseTouchControls() const
-{
-	// are we on a mobile platform? Should we force touch?
-	return SVirtualJoystick::ShouldDisplayTouchInterface() || bForceTouchControls;
 }
 
 void ATeamProject_MOUPlayerController::ShowLoginWidgetIfNeeded()

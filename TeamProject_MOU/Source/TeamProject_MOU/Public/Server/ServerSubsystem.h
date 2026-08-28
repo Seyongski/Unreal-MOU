@@ -311,6 +311,65 @@ public:
 	DECLARE_MULTICAST_DELEGATE_OneParam(FOnMOUTravelFailed, const FString& /*Reason*/);
 	FOnMOUTravelFailed OnTravelFailed;
 
+	// ─────────────────────────────────────────────────────────────────
+	// 여행 (2026-08-29: ULobbyWidgetBase 에서 여기로 옮겼다)
+	//
+	// [왜 옮겼나 — 위젯이 여행을 맡으면 안 되는 이유]
+	//   출발 신호(RoomHostReady)를 받는 주체가 UMG 위젯이었다. 구독이
+	//   NativeConstruct 에서 걸리고 NativeDestruct 에서 풀리므로, 게임이 시작될 때
+	//   BP 가 로비 위젯을 닫으면 **신호를 받을 사람이 사라진다.** 그러면 참여자는
+	//   영영 떠나지 않고 "이동합니다..." 상태로 굳는다.
+	//
+	//   게다가 신호는 캐시되지 않아서, 위젯을 다시 만들어도 복구되지 않았다.
+	//
+	//   방장 쪽 감시(PollListenServer)는 이미 이 서브시스템에 있다. 같은 이유였다 —
+	//   "방장은 곧 OpenLevel 로 맵을 갈아타므로 위젯이 감시를 맡으면 감시자가
+	//   사라진다"(아래 RoomStart 처리 주석). 참여자 쪽만 그 원칙이 안 지켜져 있었다.
+	//
+	// 위젯은 이제 **설정을 넘겨주고 화면을 그리는 일**만 한다.
+	// ─────────────────────────────────────────────────────────────────
+
+	/**
+	 * 여행에 필요한 값을 서브시스템에 등록한다. 로비 위젯이 자기 설정을 넘긴다.
+	 *
+	 * 값의 주인은 여전히 WBP 다(디자이너가 거기서 고친다). 다만 **행동**은 여기서
+	 * 하므로, 위젯이 죽어도 이 값들은 남아 있어야 한다.
+	 *
+	 * @param InHostMapName  방장이 리슨서버로 열 맵. 비면 여행하지 않는다(BP 가 맡는다)
+	 * @param bInAutoTravel  참여자가 출발 신호를 받으면 자동으로 ClientTravel 할지
+	 * @param bInPreloadMap  참여자가 기다리는 동안 맵을 미리 올릴지
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MOU|Lobby")
+	void ConfigureTravel(const FString& InHostMapName, bool bInAutoTravel = true, bool bInPreloadMap = false);
+
+	/**
+	 * 방 비밀번호를 보관한다. 방장이면 URL 에 실어 리슨서버를 열고,
+	 * 참여자면 ClientTravel URL 에 실어 보낸다.
+	 *
+	 * 위젯이 들고 있으면 위젯과 함께 사라진다 — 그러면 여행 URL 에서 비밀번호가
+	 * 빠지고, 호스트의 PreLogin 이 검사하는 순간 거부된다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MOU|Lobby")
+	void SetRoomPassword(const FString& InRoomPassword);
+
+	/**
+	 * 참여자가 방장에게 붙는다. 보통은 출발 신호를 받을 때 자동으로 불린다.
+	 *
+	 * bAutoTravelOnGameStart 를 꺼두고 BP 가 연출을 넣은 뒤 직접 부를 수도 있다.
+	 * 아직 출발 신호를 못 받았으면 아무 일도 하지 않고 false 를 돌려준다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MOU|Lobby")
+	bool TravelToHost();
+
+	/**
+	 * 출발 신호를 이미 받아 두었는가. 위젯이 새로 만들어졌을 때 상태를 복원하는 데 쓴다.
+	 *
+	 * ★ 이것이 캐시의 존재 이유다. 예전에는 신호가 브로드캐스트되고 버려져서,
+	 *   그 순간 듣고 있던 위젯이 없으면 정보가 통째로 사라졌다.
+	 */
+	UFUNCTION(BlueprintPure, Category = "MOU|Lobby")
+	bool HasPendingHostReady() const { return PendingHostReady.bSuccess; }
+
 	/**
 	 * 지금 쓰고 있는 백엔드 이름. "자체 서버(TCP)" / "EOS".
 	 * 디버그 화면에 띄워두면 "어디에 붙어 있는지" 를 묻지 않아도 된다.
@@ -543,6 +602,17 @@ private:
 	bool IsListenServerUp() const;
 
 	/**
+	 * 참여자가 출발 신호를 못 받은 채 너무 오래 기다리지 않는지 본다. (2026-08-29)
+	 *
+	 * 방장 쪽 PollListenServer 와 짝이다. 그쪽은 "내 서버가 떴는가" 를 보고,
+	 * 이쪽은 "방장이 끝내 못 열었는가" 를 본다. 둘 다 매 틱 돈다.
+	 */
+	void PollGuestHostReadyTimeout(float DeltaTime);
+
+	/** 방장이 리슨서버를 연다. HostMapName 이 비어 있으면 아무것도 하지 않는다. */
+	void TravelAsHost();
+
+	/**
 	 * 리슨서버가 뜬 직후, 외부 참여자가 들어오려면 무엇이 더 필요한지 로그에 남긴다.
 	 * 값(이 PC 의 LAN IP, 실제 리슨 포트)까지 채워서 그대로 공유기에 옮겨 적을 수 있게 한다.
 	 */
@@ -635,6 +705,43 @@ private:
 
 	/** 기다린 시간. UMOUServerSettings::HostReadyTimeoutSeconds 를 넘으면 포기한다. */
 	float ListenServerWaitSeconds = 0.f;
+
+	// ─── 여행 상태 (2026-08-29) ──────────────────────────────────────
+	// 전부 위젯이 아니라 여기 있다. 위젯은 레벨과 함께 죽는다.
+
+	/** 로비 위젯이 ConfigureTravel 로 넘겨준 값. */
+	FString HostMapName;
+	bool    bAutoTravelOnGameStart = true;
+	bool    bPreloadMapWhileWaiting = false;
+
+	/**
+	 * 방장이면 내가 정한 값, 참여자면 입장할 때 쓴 값. 여행 URL 에 실린다.
+	 *
+	 * 이름에 Travel 을 붙인 이유: CreateRoom / JoinRoom 의 매개변수 이름이
+	 * RoomPassword 라, 그냥 RoomPassword 로 두면 그 안에서 멤버를 가린다(C4458).
+	 * 쓰임도 다르다 — 저쪽은 로비 서버에 보내는 값이고 이것은 여행 URL 에 싣는 값이다.
+	 */
+	FString TravelRoomPassword;
+
+	/**
+	 * 받아둔 출발 신호. bSuccess 가 참이면 "지금 떠나도 된다" 는 뜻이다.
+	 *
+	 * 브로드캐스트하고 버리지 않고 여기 남긴다 — 그래야 그 순간 듣고 있던 위젯이
+	 * 없었어도, 나중에 만들어진 위젯이 HasPendingHostReady 로 상태를 복원할 수 있다.
+	 */
+	FMOURoomJoinResult PendingHostReady;
+
+	/**
+	 * 참여자가 RoomStart 를 받고 나서 흐른 시간. 출발 신호를 기다리는 중에만 센다.
+	 *
+	 * [왜 필요한가]
+	 *   방장의 리슨서버가 안 열리면 서버는 출발 신호를 **보내지 않는다**(죽은 주소로
+	 *   보내지 않으려고 일부러 그런다). 그런데 그러면 참여자에게는 아무것도 안 오고,
+	 *   화면은 "방장이 서버를 여는 중입니다..." 로 영원히 굳는다.
+	 *   기다림에는 끝이 있어야 한다.
+	 */
+	bool  bGuestWaitingForHostReady = false;
+	float GuestWaitSeconds = 0.f;
 
 	/**
 	 * 미리 올린 맵 패키지. UPROPERTY 참조가 GC 를 막는다.

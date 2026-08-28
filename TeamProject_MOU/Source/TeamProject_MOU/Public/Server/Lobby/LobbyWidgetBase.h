@@ -371,17 +371,16 @@ private:
 	void CloseChildWidgets();
 	void SetPanelVisible(bool bVisible);
 
-	/** 게임 시작 시 방장이 리슨서버를 연다. HostMapName 이 비어있으면 아무것도 하지 않는다. */
-	void TravelAsHost();
-
-	/** 게임 시작 시 참여자가 호스트에게 붙는다. */
-	void TravelAsClient(const FMOURoomJoinResult& Host, const FString& RoomPassword);
-
-	/**
-	 * 참여자가 기다리는 동안 HostMapName 을 비동기로 미리 올린다.
-	 * 이미 시작했으면 아무 일도 하지 않는다. 실패는 조용히 넘어간다.
-	 */
-	void BeginPreloadHostMap();
+	// ★ TravelAsHost / TravelAsClient / BeginPreloadHostMap 은 2026-08-29 에
+	//   UServerSubsystem 으로 옮겼다(각각 TravelAsHost / TravelToHost / BeginPreloadMap).
+	//
+	//   이 위젯은 게임이 시작되면 닫힐 수 있고, 닫히면 NativeDestruct 가 델리게이트를
+	//   해제한다. 그러면 출발 신호(OnRoomHostReady)를 받을 사람이 사라져 참여자가
+	//   영영 안 떠난다. 실제로 그 버그를 며칠 쫓았다.
+	//
+	//   아래 HostMapName / bAutoTravelOnGameStart / bPreloadMapWhileWaiting 은
+	//   그대로 남는다 — **값의 주인은 여전히 WBP 다.** NativeConstruct 에서
+	//   UServerSubsystem::ConfigureTravel 로 넘겨준다.
 
 	/** 접속/이동 실패 사유를 화면에 띄운다. UServerSubsystem::OnTravelFailed 구독. */
 	void HandleTravelFailed(const FString& Reason);
