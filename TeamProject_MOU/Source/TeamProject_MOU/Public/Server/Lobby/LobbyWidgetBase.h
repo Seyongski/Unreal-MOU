@@ -383,6 +383,11 @@ private:
 	 */
 	void BeginPreloadHostMap();
 
+	/** 접속/이동 실패 사유를 화면에 띄운다. UServerSubsystem::OnTravelFailed 구독. */
+	void HandleTravelFailed(const FString& Reason);
+
+	FDelegateHandle TravelFailedHandle;
+
 	UServerSubsystem* GetServerSubsystem() const;
 
 	UPROPERTY()

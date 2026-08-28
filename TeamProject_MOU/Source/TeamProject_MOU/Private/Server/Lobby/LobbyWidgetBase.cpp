@@ -79,6 +79,10 @@ void ULobbyWidgetBase::NativeConstruct()
 			Chat->OnRoomClosed.AddDynamic(this, &ULobbyWidgetBase::HandleRoomClosed);
 			Chat->OnRoomGameStarted.AddDynamic(this, &ULobbyWidgetBase::HandleGameStarted);
 			Chat->OnRoomHostReady.AddDynamic(this, &ULobbyWidgetBase::HandleHostReady);
+
+			// 접속 실패를 화면에 그대로 띄운다. UFUNCTION 이 아니라 순수 델리게이트라
+			// AddDynamic 이 아니라 AddUObject 를 쓴다.
+			TravelFailedHandle = Chat->OnTravelFailed.AddUObject(this, &ULobbyWidgetBase::HandleTravelFailed);
 			bSubscribed = true;
 		}
 	}
@@ -123,6 +127,12 @@ void ULobbyWidgetBase::NativeDestruct()
 			Chat->OnRoomClosed.RemoveDynamic(this, &ULobbyWidgetBase::HandleRoomClosed);
 			Chat->OnRoomGameStarted.RemoveDynamic(this, &ULobbyWidgetBase::HandleGameStarted);
 			Chat->OnRoomHostReady.RemoveDynamic(this, &ULobbyWidgetBase::HandleHostReady);
+
+			if (TravelFailedHandle.IsValid())
+			{
+				Chat->OnTravelFailed.Remove(TravelFailedHandle);
+				TravelFailedHandle.Reset();
+			}
 		}
 		bSubscribed = false;
 	}
@@ -793,12 +803,32 @@ void ULobbyWidgetBase::TravelAsHost()
 	UGameplayStatics::OpenLevel(this, FName(*HostMapName), /*bAbsolute=*/true, Options);
 }
 
+
+void ULobbyWidgetBase::HandleTravelFailed(const FString& Reason)
+{
+	// 대기실에 있든 이미 메인메뉴로 돌아왔든 알려준다. 접속 실패는 어느
+	// 화면에서 받든 사용자가 알아야 하는 정보다.
+	SetMessage(Reason, /*bIsError=*/true);
+
+	// 대기실에 남아 있으면 "이동합니다..." 상태로 굳어 있으므로 풀어준다.
+	// 방 자체는 서버에 살아 있으니 메인메뉴로 쫓아내지는 않는다 —
+	// 방장이 포워딩을 고치고 다시 시작하면 그대로 다시 붙을 수 있다.
+	RefreshUI();
+}
 void ULobbyWidgetBase::TravelAsClient(const FMOURoomJoinResult& Host, const FString& RoomPassword)
 {
 	APlayerController* PC = GetOwningPlayer();
 	if (PC == nullptr)
 	{
 		return;
+	}
+
+	// 어디로 떠나는지 서브시스템에 남겨둔다. 접속에 실패하면 그 주소를 그대로
+	// 넣어 "어디에 못 붙었는지" 를 말해줄 수 있다 — 실패가 조용하면 원인을
+	// 찾을 수 없다는 것을 이미 며칠에 걸쳐 배웠다.
+	if (UServerSubsystem* Server = GetServerSubsystem())
+	{
+		Server->NotifyTravelingTo(Host.HostAddress, Host.HostPort);
 	}
 
 	// MakeTravelURL 이 "IP:포트?RoomPassword=1234" 를 만들어준다.

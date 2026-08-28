@@ -71,6 +71,14 @@ void UServerSubsystem::Initialize(FSubsystemCollectionBase& Collection)
 	TickHandle = FTSTicker::GetCoreTicker().AddTicker(
 		FTickerDelegate::CreateUObject(this, &UServerSubsystem::Tick));
 
+	// 엔진의 접속/이동 실패를 받아 사람이 읽을 문장으로 바꿔 알린다.
+	// 이게 없으면 실패가 화면에 "이동합니다..." 로 그대로 남아 원인을 알 수 없다.
+	if (GEngine != nullptr)
+	{
+		NetworkFailureHandle = GEngine->OnNetworkFailure().AddUObject(this, &UServerSubsystem::HandleNetworkFailure);
+		TravelFailureHandle  = GEngine->OnTravelFailure().AddUObject(this, &UServerSubsystem::HandleTravelFailure);
+	}
+
 	UE_LOG(LogMOUServer, Log, TEXT("채팅 서브시스템 초기화 완료. 접속하려면 ConnectToChatServer 를 호출한다."));
 }
 
@@ -82,6 +90,13 @@ void UServerSubsystem::Deinitialize()
 	{
 		FTSTicker::GetCoreTicker().RemoveTicker(TickHandle);
 		TickHandle.Reset();
+	}
+
+	// 엔진 델리게이트를 먼저 뗀다. 안 떼면 파괴된 서브시스템으로 호출이 들어온다.
+	if (GEngine != nullptr)
+	{
+		if (NetworkFailureHandle.IsValid()) { GEngine->OnNetworkFailure().Remove(NetworkFailureHandle); }
+		if (TravelFailureHandle.IsValid())  { GEngine->OnTravelFailure().Remove(TravelFailureHandle);  }
 	}
 
 	ShutdownClient();
@@ -1151,6 +1166,78 @@ void UServerSubsystem::ReleasePreloadedMap()
 	PreloadedMapName.Reset();
 }
 
+
+// ---------------------------------------------------------------------------
+// 접속 실패를 사람이 읽을 수 있게 (2026-08-28)
+//
+// 참여자가 방장에게 못 붙어도 화면에는 "이동합니다..." 만 남아 있었다.
+// 엔진은 이미 실패를 알고 있으므로(ENetworkFailure) 받아서 번역만 하면 된다.
+// ---------------------------------------------------------------------------
+
+void UServerSubsystem::NotifyTravelingTo(const FString& HostAddress, int32 HostPort)
+{
+	PendingTravelAddress = FString::Printf(TEXT("%s:%d"), *HostAddress, HostPort);
+
+	UE_LOG(LogMOUServer, Log, TEXT("[참여자] %s 로 접속을 시도한다."), *PendingTravelAddress);
+}
+
+void UServerSubsystem::HandleNetworkFailure(UWorld* /*World*/, UNetDriver* /*NetDriver*/,
+                                            ENetworkFailure::Type FailureType,
+                                            const FString& ErrorString)
+{
+	const FString Target = PendingTravelAddress.IsEmpty()
+		? TEXT("호스트") : PendingTravelAddress;
+
+	FString Reason;
+
+	switch (FailureType)
+	{
+	case ENetworkFailure::ConnectionTimeout:
+	case ENetworkFailure::FailureReceived:
+	case ENetworkFailure::PendingConnectionFailure:
+		// 압도적으로 흔한 경우다. 주소는 맞는데 그 주소로 패킷이 안 들어가는 것.
+		// 무엇을 해야 하는지까지 적어야 화면만 보고도 해결할 수 있다.
+		Reason = FString::Printf(
+			TEXT("%s 에 접속하지 못했습니다.\n")
+			TEXT("방장 PC 가 있는 네트워크의 공유기에 'UDP 7777 -> 방장 PC' 포트포워딩이 필요합니다.\n")
+			TEXT("(로그인 서버 쪽 공유기 설정과는 다른 곳입니다)"),
+			*Target);
+		break;
+
+	case ENetworkFailure::OutdatedClient:
+	case ENetworkFailure::OutdatedServer:
+		Reason = TEXT("방장과 게임 버전이 다릅니다. 같은 빌드로 맞춰야 합니다.");
+		break;
+
+	default:
+		Reason = FString::Printf(TEXT("%s 접속 중 네트워크 오류가 났습니다: %s"),
+			*Target, *ErrorString);
+		break;
+	}
+
+	UE_LOG(LogMOUServer, Error, TEXT("[접속 실패] %s (엔진 사유: %d / %s)"),
+		*Reason, static_cast<int32>(FailureType), *ErrorString);
+
+	OnTravelFailed.Broadcast(Reason);
+	PendingTravelAddress.Reset();
+}
+
+void UServerSubsystem::HandleTravelFailure(UWorld* /*World*/,
+                                           ETravelFailure::Type FailureType,
+                                           const FString& ErrorString)
+{
+	// 여기까지 오는 것은 대개 맵 문제다(이름이 틀렸거나 쿠킹에서 빠졌거나).
+	// 네트워크 실패와 구분해서 말해야 엉뚱한 곳을 뒤지지 않는다.
+	const FString Reason = FString::Printf(
+		TEXT("레벨 이동에 실패했습니다: %s\n맵 이름(HostMapName)이 맞는지 확인하세요."),
+		*ErrorString);
+
+	UE_LOG(LogMOUServer, Error, TEXT("[이동 실패] %s (사유 %d)"),
+		*Reason, static_cast<int32>(FailureType));
+
+	OnTravelFailed.Broadcast(Reason);
+	PendingTravelAddress.Reset();
+}
 void UServerSubsystem::LogListenServerReachability() const
 {
 	// GetLocalAddr() 이 non-const 라 여기서도 const 를 걸지 않는다.

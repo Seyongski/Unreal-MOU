@@ -302,6 +302,16 @@ public:
 	void ReleasePreloadedMap();
 
 	/**
+	 * 참여자가 이 주소로 떠난다고 알려둔다. 접속에 실패하면 이 값을 넣어
+	 * "어디에 못 붙었는지" 를 그대로 말해줄 수 있다.
+	 */
+	void NotifyTravelingTo(const FString& HostAddress, int32 HostPort);
+
+	/** 접속 실패 사유를 사람이 읽을 문장으로. UI 가 그대로 띄워도 되게 만든다. */
+	DECLARE_MULTICAST_DELEGATE_OneParam(FOnMOUTravelFailed, const FString& /*Reason*/);
+	FOnMOUTravelFailed OnTravelFailed;
+
+	/**
 	 * 지금 쓰고 있는 백엔드 이름. "자체 서버(TCP)" / "EOS".
 	 * 디버그 화면에 띄워두면 "어디에 붙어 있는지" 를 묻지 않아도 된다.
 	 */
@@ -537,6 +547,32 @@ private:
 	 * 값(이 PC 의 LAN IP, 실제 리슨 포트)까지 채워서 그대로 공유기에 옮겨 적을 수 있게 한다.
 	 */
 	void LogListenServerReachability() const;
+
+	/**
+	 * 참여자가 방장에게 붙다가 실패했을 때 **왜** 실패했는지 알린다. (2026-08-28)
+	 *
+	 * [왜 필요한가 — 침묵이 가장 비쌌다]
+	 *   여행이 실패해도 화면에는 "호스트 ...:7777 로 이동합니다..." 만 그대로
+	 *   남아 있었다. 접속을 시도 중인지, 이미 실패했는지, 주소가 틀린 건지
+	 *   포트가 안 열린 건지 구분할 방법이 전혀 없었다.
+	 *   실제로 이 침묵 때문에 며칠을 서버 코드에서 원인을 찾았는데,
+	 *   서버는 처음부터 정상이었고 막힌 곳은 방장 쪽 공유기였다.
+	 *
+	 *   엔진은 이미 실패를 알고 있다(ENetworkFailure). 그걸 받아 사람이 읽을
+	 *   수 있는 문장으로 바꿔주기만 하면 된다.
+	 */
+	void HandleNetworkFailure(UWorld* World, UNetDriver* NetDriver,
+	                          ENetworkFailure::Type FailureType, const FString& ErrorString);
+
+	/** 레벨 이동 자체가 실패한 경우(맵을 못 찾는 등). 위와 같은 이유로 필요하다. */
+	void HandleTravelFailure(UWorld* World, ETravelFailure::Type FailureType, const FString& ErrorString);
+
+	/** 참여자가 방금 어디로 떠났는지. 실패 메시지에 주소를 같이 적으려고 들고 있다. */
+	FString PendingTravelAddress;
+
+	/** 구독 해제용. 안 떼면 서브시스템이 죽은 뒤에도 엔진이 호출한다. */
+	FDelegateHandle NetworkFailureHandle;
+	FDelegateHandle TravelFailureHandle;
 
 	void SetConnectionState(EChatConnectionState NewState, const FString& Detail = FString());
 
