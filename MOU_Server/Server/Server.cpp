@@ -882,7 +882,7 @@ namespace
 
 		uint32_t NewRoomId = 0;
 		const ERoomResult R = Rooms::Create(
-			Session->UserId, Session->Name, Candidates,
+			Session->UserId, Session->Name, Candidates, Session->bLanOnly,
 			Title, Req.bHasPassword != 0, Password, Req.MaxPlayers, NewRoomId);
 
 		if (R == ERoomResult::Success)
@@ -896,6 +896,12 @@ namespace
 				std::printf("[방 생성]   후보 %s:%u (%s)\n", C.Address, C.Port,
 				            C.Kind == static_cast<uint8_t>(EHostAddrKind::Lan) ? "LAN" : "공인");
 			}
+
+			// 프로브를 돌리지 않은 클라이언트도 있을 수 있다(구버전, 프로브 실패).
+			// 그때는 "모름" 이고, 방은 예전처럼 아무 제한 없이 동작한다.
+			std::printf("[방 생성]   외부 접속: %s\n",
+			            !Session->bHasReachabilityReport ? "확인 안 됨"
+			            : (Session->bLanOnly ? "**불가** (같은 LAN 전용 방)" : "가능"));
 		}
 		else
 		{
@@ -1149,18 +1155,29 @@ namespace
 		RoomReachabilityReqBody Req{};
 		std::memcpy(&Req, Body, sizeof(Req));
 
-		uint32_t RoomId = 0;
-		const ERoomResult R = Rooms::SetReachability(Session->UserId, Req.bReachable != 0, RoomId);
-		if (R != ERoomResult::Success)
-		{
-			std::printf("[거부] 도달성 신고 실패: %s(%llu) (사유 %u)\n", Session->Name.c_str(),
-			            static_cast<unsigned long long>(Session->UserId), static_cast<unsigned>(R));
-			return true;
-		}
+		const bool bReachable = (Req.bReachable != 0);
 
-		std::printf("[도달성] 방 #%u 는 %s\n", RoomId,
-		            Req.bReachable ? "외부에서 들어올 수 있다"
-		                           : "**같은 LAN 에서만** 들어올 수 있다 (공유기가 포워딩을 안 한다)");
+		// ★ 세션에 먼저 적는다. 이것이 진실의 원본이다.
+		//
+		//   프로브는 **방을 만들기 전에** 돈다 — 그때만 게임 포트가 비어 있기 때문이다.
+		//   그래서 이 신고가 RoomCreateReq 보다 먼저 오는 것이 오히려 정상이다.
+		//   방에만 적으려 하면 "아직 방이 없다"(NotInRoom)로 버려지고, 정작 방에는
+		//   표시가 안 붙는다. 실제로 그렇게 조용히 버려지고 있었다.
+		Session->bLanOnly               = !bReachable;
+		Session->bHasReachabilityReport = true;
+
+		std::printf("[도달성] %s(%llu) 는 %s\n", Session->Name.c_str(),
+		            static_cast<unsigned long long>(Session->UserId),
+		            bReachable ? "외부에서 들어올 수 있다"
+		                       : "**같은 LAN 에서만** 들어올 수 있다 (공유기가 포워딩을 안 한다)");
+
+		// 이미 방이 있으면 그 방도 같이 갱신한다. 방을 만든 뒤 다시 확인한 경우다.
+		// 방이 없으면 위에 적어둔 값이 RoomCreateReq 에서 얹힌다 — 오류가 아니다.
+		uint32_t RoomId = 0;
+		if (Rooms::SetReachability(Session->UserId, bReachable, RoomId) == ERoomResult::Success)
+		{
+			std::printf("[도달성]   방 #%u 에 반영했다.\n", RoomId);
+		}
 		return true;
 	}
 

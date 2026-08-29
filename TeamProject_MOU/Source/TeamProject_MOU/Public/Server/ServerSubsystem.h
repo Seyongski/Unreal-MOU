@@ -828,6 +828,21 @@ private:
 	/** 프로브 전용 UDP 소켓. 결과가 나오면 반드시 닫는다 — 게임 포트를 잡고 있다. */
 	class FSocket* ProbeSocket = nullptr;
 
+	/**
+	 * 마지막 프로브 결과. 방이 생긴 뒤 다시 신고하는 데 쓴다. (2026-08-29)
+	 *
+	 * [왜 보관해야 하는가 — 실제로 난 버그]
+	 *   프로브는 **방 만들기 창이 열릴 때** 시작한다(그때 게임 포트가 비어 있어서다).
+	 *   그런데 결과가 나오는 시점은 사용자가 제목을 다 치고 "만들기" 를 누르기
+	 *   전일 수도, 후일 수도 있다. 앞이면 서버에 방이 아직 없어서 신고가
+	 *   NotInRoom 으로 거부되고, 그 방은 도달성 표시 없이 남는다.
+	 *
+	 *   즉 **입력 속도에 따라 갈리는 레이스**였다. 빨리 치면 되고 천천히 치면 안 됐다.
+	 *   결과를 들고 있다가 RoomCreateAck 에서 한 번 더 보내면 순서와 무관해진다.
+	 */
+	bool bHasReachabilityResult = false;
+	bool bLastReachable = false;
+
 	/** 프로브를 끝내고 결과를 알린다. 소켓을 닫는 유일한 경로다. */
 	void FinishReachabilityProbe(bool bReachable, const FString& Detail);
 

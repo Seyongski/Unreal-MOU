@@ -1403,18 +1403,18 @@ void UServerSubsystem::FinishReachabilityProbe(bool bReachable, const FString& D
 	ProbeTotalSeconds = 0.f;
 	ProbeNonce        = 0;
 
-	if (bReachable)
-	{
-		UE_LOG(LogMOUServer, Log, TEXT("[프로브] 외부에서 들어올 수 있다. %s"), *Detail);
-	}
-	else
-	{
-		UE_LOG(LogMOUServer, Warning,
-			TEXT("[프로브] 외부에서 들어올 수 **없다**. %s\n")
-			TEXT("         이 방은 같은 공유기 안의 인원만 참여할 수 있다."), *Detail);
-	}
+	UE_CLOG(bReachable, LogMOUServer, Log,
+		TEXT("[프로브] 외부에서 들어올 수 있다. %s"), *Detail);
+	UE_CLOG(!bReachable, LogMOUServer, Warning,
+		TEXT("[프로브] 외부에서 들어올 수 **없다**. %s"), *Detail);
+
+	// ★ 결과를 보관한다. 지금 신고가 거부돼도(방이 아직 없으면 NotInRoom)
+	//   RoomCreateAck 에서 다시 보낸다. 자세한 이유는 헤더의 bHasReachabilityResult 주석.
+	bHasReachabilityResult = true;
+	bLastReachable         = bReachable;
 
 	// 서버에도 알려서 방에 표시한다. 참여자가 그것을 보고 헛걸음을 피한다.
+	// 이미 방 안이면 이 한 번으로 끝나고, 아직 없으면 방이 생길 때 다시 간다.
 	if (Backend.IsValid())
 	{
 		Backend->ReportReachability(bReachable);

@@ -119,6 +119,7 @@ namespace
 
 ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
                    const std::vector<HostCandidate>& Candidates,
+                   bool bLanOnly,
                    const std::string& Title, bool bHasPassword,
                    const std::string& Password, uint8_t MaxPlayers,
                    uint32_t& OutRoomId)
@@ -150,6 +151,7 @@ ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
 	NewRoom.HostUserId   = HostUserId;
 	NewRoom.HostName     = HostName;
 	NewRoom.Candidates   = Candidates;
+	NewRoom.bLanOnly     = bLanOnly;   // 프로브 결과. 방보다 먼저 올 수 있어 세션이 들고 있다가 여기서 얹는다
 
 	NewRoom.Title        = Title;
 	NewRoom.bHasPassword = bHasPassword;

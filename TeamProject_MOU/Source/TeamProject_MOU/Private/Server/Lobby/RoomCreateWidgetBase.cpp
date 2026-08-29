@@ -92,6 +92,10 @@ void URoomCreateWidgetBase::NativeConstruct()
 	// ★ 창이 열리는 지금 포트 열기를 시작한다. 사용자가 제목을 입력하는 몇 초가
 	//   SSDP 탐색 + SOAP 왕복 시간과 겹쳐서, "방 만들기" 를 누를 때쯤이면 대개 끝나 있다.
 	//   실패해도 방 만들기는 그대로 진행된다 (헤더의 bOpenPortOnShow 주석 참고).
+	// UPnP 를 이제부터 돌릴 것인가. 돌린다면 도달성 프로브는 그것이 끝난 뒤에 해야 한다 —
+	// 매핑이 생기기 전에 확인하면 당연히 실패하고, 그 거짓 음성이 방을 LAN 전용으로 막는다.
+	bool bWillRunUpnp = false;
+
 	if (bOpenPortOnShow)
 	{
 		if (UNatPortMappingSubsystem* Nat = GetNatSubsystem())
@@ -106,6 +110,28 @@ void URoomCreateWidgetBase::NativeConstruct()
 			if (Nat->GetMappedExternalPort() == 0 && !Nat->IsMappingInProgress())
 			{
 				Nat->BeginPortMapping(HostPort);
+				bWillRunUpnp = true;
+			}
+			else if (Nat->IsMappingInProgress())
+			{
+				bWillRunUpnp = true;
+			}
+		}
+	}
+
+	// ★ UPnP 를 안 돌리는 경로에서도 도달성은 확인해야 한다. (v9)
+	//
+	//   프로브를 HandleNatMappingFinished 에만 걸어두면, 설정으로 UPnP 를 껐거나
+	//   (bUseUpnpPortMapping=False) 매핑이 이미 있는 경우에는 **한 번도 돌지 않는다.**
+	//   수동 포워딩으로 운영하는 팀이 정확히 그 경로를 탄다 — 확인이 가장 필요한
+	//   사람들이 확인을 못 받는 셈이다.
+	if (!bWillRunUpnp)
+	{
+		if (UServerSubsystem* Server = GetServerSubsystem())
+		{
+			if (!Server->IsProbingReachability())
+			{
+				Server->BeginReachabilityProbe(HostPort);
 			}
 		}
 	}

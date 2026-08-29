@@ -61,6 +61,7 @@ namespace MOU
 		 */
 		ERoomResult Create(uint64_t HostUserId, const std::string& HostName,
 		                   const std::vector<HostCandidate>& Candidates,
+		                   bool bLanOnly,
 		                   const std::string& Title, bool bHasPassword,
 		                   const std::string& Password, uint8_t MaxPlayers,
 		                   uint32_t& OutRoomId);
