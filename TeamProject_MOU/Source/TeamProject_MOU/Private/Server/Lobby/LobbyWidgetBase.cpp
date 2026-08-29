@@ -534,6 +534,23 @@ void ULobbyWidgetBase::QuitGame()
 void ULobbyWidgetBase::EnterWaitingRoom(int32 RoomId, bool bIsHost)
 {
 	UIState = EMOULobbyUIState::WaitingRoom;
+
+	// ★ 게임 포트를 지금 확보하고 서버에 등록한다. (v10)
+	//
+	//   [왜 여기인가]
+	//     대기실에 앉아 있는 동안이 유일하게 여유 있는 시점이다. 게임 시작 뒤에는
+	//     방장이 곧 OpenLevel 을 하고, 그 전에 punch 대상이 이미 정해져 있어야 한다.
+	//
+	//   [왜 참여자도 하는가]
+	//     punch 를 받는 쪽이 참여자다. 서버가 참여자의 공인 엔드포인트를 관측해
+	//     두지 않으면 방장은 어디로 쏠지 모른다.
+	//     방장도 등록해 둔다 — 다음 판에 참여자가 될 수 있고, 그때 다시 하려면
+	//     또 대기실을 거쳐야 하기 때문이다.
+	if (UServerSubsystem* Chat = GetServerSubsystem())
+	{
+		Chat->RegisterGameEndpoint(HostPort);
+	}
+
 	SetPanelVisible(true);
 	RefreshUI();
 

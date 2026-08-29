@@ -502,6 +502,22 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.Join.bSuccess    = true;
 		Event.Join.RoomId      = static_cast<int32>(Start.RoomId);
 		MOUChat::ReadHostCandidates(Start.Candidates, Start.CandidateCount, Event.Join.Candidates);
+
+		// 홀펀칭 대상 (v10). 방장에게만 의미가 있고 참여자는 무시한다.
+		Event.PunchTargets.Reset();
+		{
+			const int32 SafeCount = FMath::Min<int32>(Start.PunchTargetCount, MOU::kMaxPlayersInRoom);
+			for (int32 i = 0; i < SafeCount; ++i)
+			{
+				FMOUHostCandidate Peer;
+				Peer.Address = MOUChat::ReadFixedString(Start.PunchTargets[i].Address, static_cast<int32>(MOU::kMaxAddressLen));
+				Peer.Port    = static_cast<int32>(Start.PunchTargets[i].Port);
+				if (Peer.IsValid())
+				{
+					Event.PunchTargets.Add(MoveTemp(Peer));
+				}
+			}
+		}
 		Event.Join.bLanOnly    = (Start.bLanOnly != 0);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
@@ -526,6 +542,27 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.Join.RoomId      = static_cast<int32>(Ready.RoomId);
 		MOUChat::ReadHostCandidates(Ready.Candidates, Ready.CandidateCount, Event.Join.Candidates);
 		Event.Join.bLanOnly    = (Ready.bLanOnly != 0);
+		InboundEvents.Enqueue(MoveTemp(Event));
+		break;
+	}
+
+	case MOU::EOpcode::ClientEndpointAck:
+	{
+		if (Body.Num() < static_cast<int32>(sizeof(MOU::ClientEndpointAckBody)))
+		{
+			break;
+		}
+
+		MOU::ClientEndpointAckBody Ack{};
+		FMemory::Memcpy(&Ack, Body.GetData(), sizeof(Ack));
+
+		FServerClientEvent Event;
+		Event.Type       = EServerClientEventType::ClientEndpointAck;
+		Event.ProbeNonce = Ack.Nonce;
+		Event.bProbeSent = (Ack.bObserved != 0);
+		Event.Detail     = FString::Printf(TEXT("%s:%d"),
+			*MOUChat::ReadFixedString(Ack.Address, static_cast<int32>(MOU::kMaxAddressLen)),
+			static_cast<int32>(Ack.Port));
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}

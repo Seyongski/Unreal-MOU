@@ -440,6 +440,40 @@ public:
 	UFUNCTION(BlueprintPure, Category = "MOU|Lobby")
 	bool IsProbingReachability() const { return bProbing; }
 
+	// ─────────────────────────────────────────────────────────────────
+	// UDP 홀펀칭 (v10)
+	//
+	// [왜 필요한가 — 실측으로 갈라낸 것]
+	//   참여자 쪽 공유기는 **port-restricted cone** 이다:
+	//     · 정적 포워딩(UPnP)으로 들어오는 미요청 인바운드  -> 차단
+	//     · 자기가 먼저 쏜 상대의 **같은 포트**에서 오는 것  -> 통과
+	//     · 같은 상대라도 **다른 포트**에서 오면            -> 차단 (10발 중 0발)
+	//
+	//   그래서 방장이 참여자의 정확한 공인 IP:포트로 미리 한 발 쏘면 그 구멍으로
+	//   접속이 들어온다. 릴레이가 필요 없다.
+	//
+	// [세 조각]
+	//   ① 게임 포트 확보    참여자도 예측 가능한 포트를 쓴다 (UMOUIpNetDriver)
+	//   ② 엔드포인트 등록   그 포트에서 서버로 한 발 -> 서버가 출발지를 관측
+	//   ③ 방장의 punch      RoomStart 로 받은 대상에게 OpenLevel 직전에 쏜다
+	// ─────────────────────────────────────────────────────────────────
+
+	/**
+	 * 게임 포트를 확보하고 서버에 등록한다. 대기실에 들어갈 때 부른다.
+	 *
+	 * 확보한 포트는 UMOUIpNetDriver 에 넘겨져 ClientTravel 때 그대로 쓰인다.
+	 * 그래야 서버가 관측한 엔드포인트와 실제 접속 출발지가 같아진다.
+	 *
+	 * ★ BasePort 가 사용 중이면 다음 번호로 올라간다.
+	 *   한 PC 에서 인스턴스를 둘 띄우는 테스트가 이 폴백 없이는 깨진다.
+	 */
+	UFUNCTION(BlueprintCallable, Category = "MOU|Lobby")
+	void RegisterGameEndpoint(int32 BasePort = 7777);
+
+	/** 서버가 관측해 알려준 내 공인 엔드포인트. 등록 전이면 비어 있다. */
+	UFUNCTION(BlueprintPure, Category = "MOU|Lobby")
+	FString GetObservedEndpoint() const { return ObservedEndpoint; }
+
 	/**
 	 * 지금 쓰고 있는 백엔드 이름. "자체 서버(TCP)" / "EOS".
 	 * 디버그 화면에 띄워두면 "어디에 붙어 있는지" 를 묻지 않아도 된다.
@@ -825,8 +859,26 @@ private:
 	bool   bProbeDispatched = false;
 	/** HostProbeSent 를 기다리는 시간까지 포함한 전체 상한. */
 	float  ProbeTotalSeconds = 0.f;
-	/** 프로브 전용 UDP 소켓. 결과가 나오면 반드시 닫는다 — 게임 포트를 잡고 있다. */
-	class FSocket* ProbeSocket = nullptr;
+	/**
+	 * 게임 포트에 bind 된 UDP 소켓. 셋이 같이 쓴다. (v10 에서 프로브 전용 -> 공용)
+	 *
+	 *   · 도달성 프로브 : 서버가 쏜 확인 패킷을 받는다
+	 *   · 엔드포인트 등록: 여기서 서버로 쏴야 서버가 **이 포트**를 관측한다
+	 *   · 홀펀칭       : 여기서 쏴야 NAT 구멍이 **이 포트**에 뚫린다
+	 *
+	 * ★ 셋 다 같은 소켓이어야 하는 이유가 같다. 다른 소켓을 쓰면 검증·등록·개방이
+	 *   전부 엉뚱한 포트에 일어나고, 정작 게임이 쓸 포트는 아무것도 안 된 채 남는다.
+	 *
+	 * ★ 여행 직전에 반드시 닫는다. 열어둔 채 OpenLevel/ClientTravel 하면
+	 *   넷드라이버가 같은 포트를 잡지 못한다.
+	 */
+	class FSocket* GameSocket = nullptr;
+
+	/** 게임 포트를 확보한다. 이미 있으면 아무 일도 하지 않는다. 실패하면 false. */
+	bool EnsureGameSocket(int32 BasePort);
+
+	/** 게임 소켓을 닫는다. 여행 직전과 종료 시에 부른다. */
+	void CloseGameSocket();
 
 	/**
 	 * 마지막 프로브 결과. 방이 생긴 뒤 다시 신고하는 데 쓴다. (2026-08-29)
@@ -842,6 +894,30 @@ private:
 	 */
 	bool bHasReachabilityResult = false;
 	bool bLastReachable = false;
+
+	// ─── 홀펀칭 상태 (v10) ──────────────────────────────────────────
+	/**
+	 * 확보한 게임 포트. 0 이면 확보하지 못했다(= 홀펀칭 없이 예전처럼 동작).
+	 *
+	 * ★ 프로브 소켓과 **같은 포트**여야 한다. 다른 포트로 확인하거나 punch 하면
+	 *   정작 리슨서버/클라이언트가 쓸 포트는 검증도 개방도 안 된 채 남는다.
+	 */
+	int32 ReservedGamePort = 0;
+
+	/** 서버가 관측해 알려준 내 공인 엔드포인트. 진단용 표시에 쓴다. */
+	FString ObservedEndpoint;
+
+	/** 방장이 punch 할 대상. RoomStart 로 받는다. */
+	TArray<FMOUHostCandidate> PunchTargets;
+
+	/**
+	 * 대상들에게 더미 UDP 를 몇 발 쏜다. OpenLevel 직전에 부른다.
+	 *
+	 * ★ 프로브 소켓(= 게임 포트에 bind 된 소켓)으로 쏴야 한다.
+	 *   다른 소켓으로 쏘면 NAT 에 뚫리는 구멍이 그 소켓의 포트에 생기고,
+	 *   정작 리슨서버가 쓸 포트는 그대로 막혀 있다.
+	 */
+	void PunchTowardPeers();
 
 	/** 프로브를 끝내고 결과를 알린다. 소켓을 닫는 유일한 경로다. */
 	void FinishReachabilityProbe(bool bReachable, const FString& Detail);

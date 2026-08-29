@@ -24,7 +24,8 @@
 #include "Engine/GameInstance.h"
 #include "Engine/NetDriver.h"
 #include "SocketSubsystem.h"
-#include "Sockets.h"                          // FSocket (도달성 프로브가 직접 쓴다)
+#include "Sockets.h"                          // FSocket (프로브·등록·홀펀칭이 직접 쓴다)
+#include "Server/Net/MOUIpNetDriver.h"        // 클라이언트 바인드 포트 고정 (v10)
 #include "IPAddress.h"
 #include "Engine/World.h"
 #include "GameFramework/PlayerController.h"   // ClientTravel (참여자 여행)
@@ -126,12 +127,13 @@ void UServerSubsystem::ShutdownClient()
 	bWaitingForListenServer = false;
 	ListenServerWaitSeconds = 0.f;
 
-	// ★ 프로브 소켓이 열려 있으면 반드시 닫는다. 게임 포트를 잡고 있어서,
-	//   남겨두면 다음에 리슨서버가 같은 포트를 못 연다.
+	// ★ 게임 포트 소켓을 반드시 놓아준다. 들고 있으면 다음에 리슨서버나
+	//   넷드라이버가 같은 포트를 못 연다.
 	if (bProbing)
 	{
 		FinishReachabilityProbe(false, TEXT("종료 중이라 확인을 중단했습니다."));
 	}
+	CloseGameSocket();
 
 	if (ConnectionState != EChatConnectionState::Disconnected)
 	{
@@ -864,6 +866,11 @@ bool UServerSubsystem::Tick(float DeltaTime)
 				bWaitingForListenServer = true;
 				ListenServerWaitSeconds = 0.f;
 			}
+
+				// 방장이 punch 할 대상. OpenLevel 직전에 쓴다.
+				PunchTargets = Event.PunchTargets;
+				UE_CLOG(PunchTargets.Num() > 0, LogMOUServer, Log,
+					TEXT("[홀펀칭] 참여자 %d명의 주소를 받았다."), PunchTargets.Num());
 			else
 			{
 				// 참여자는 지금부터 출발 신호를 기다린다. 끝없이 기다리지는 않는다.
@@ -912,6 +919,12 @@ bool UServerSubsystem::Tick(float DeltaTime)
 			}
 			break;
 		}
+
+		case EServerClientEventType::ClientEndpointAck:
+			// 서버가 내 공인 게임 엔드포인트를 관측했다. 방장이 punch 할 주소가 이것이다.
+			ObservedEndpoint = Event.Detail;
+			UE_LOG(LogMOUServer, Log, TEXT("[엔드포인트] 서버가 내 게임 주소를 %s 로 봤다."), *ObservedEndpoint);
+			break;
 
 		case EServerClientEventType::HostProbeSent:
 			// 서버가 쐈다. 지금부터 도착을 기다린다.
@@ -1256,6 +1269,92 @@ namespace
 //   잡지 못한다. 그래서 닫는 경로를 FinishReachabilityProbe 하나로 모았다.
 // ---------------------------------------------------------------------------
 
+bool UServerSubsystem::EnsureGameSocket(int32 BasePort)
+{
+	if (GameSocket != nullptr)
+	{
+		return true;   // 이미 확보했다
+	}
+	if (BasePort <= 0 || BasePort > 65535)
+	{
+		return false;
+	}
+
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (Sockets == nullptr)
+	{
+		return false;
+	}
+
+	// ★ BasePort 가 막혀 있으면 다음 번호로 올라간다.
+	//
+	//   한 PC 에서 인스턴스를 둘 띄우는 테스트(같은 LAN 참여자 재현)가 이 폴백
+	//   없이는 통째로 깨진다 — 둘이 같은 포트를 잡을 수 없기 때문이다.
+	//   실제로 잡힌 번호를 서버에 등록하므로, 번호가 밀려도 홀펀칭은 그대로 된다.
+	constexpr int32 MaxAttempts = 8;
+
+	for (int32 Attempt = 0; Attempt < MaxAttempts; ++Attempt)
+	{
+		const int32 TryPort = BasePort + Attempt;
+
+		FSocket* Socket = Sockets->CreateSocket(NAME_DGram, TEXT("MOU.GamePort"), FNetworkProtocolTypes::IPv4);
+		if (Socket == nullptr)
+		{
+			return false;
+		}
+
+		Socket->SetNonBlocking(true);
+
+		// ★ SetReuseAddr 를 쓰지 않는다.
+		//   윈도우에서 SO_REUSEADDR 는 이미 쓰고 있는 UDP 포트에 두 번째 소켓이
+		//   끼어들 수 있게 만든다. 그러면 들어온 패킷이 둘 중 하나에만 가고,
+		//   프로브는 "안 왔다" 고 오판한다. 이미 쓰는 중이면 bind 를 실패시켜
+		//   다음 번호로 넘어가는 편이 정직하다.
+
+		TSharedRef<FInternetAddr> BindAddr = Sockets->CreateInternetAddr();
+		BindAddr->SetAnyAddress();
+		BindAddr->SetPort(TryPort);
+
+		if (Socket->Bind(*BindAddr))
+		{
+			GameSocket       = Socket;
+			ReservedGamePort = TryPort;
+
+			// 넷드라이버가 ClientTravel 때 같은 포트를 쓰게 한다.
+			// 이것이 없으면 서버가 관측한 엔드포인트와 실제 접속 출발지가 달라져
+			// 방장이 엉뚱한 곳에 punch 하게 된다.
+			UMOUIpNetDriver::SetDesiredClientPort(TryPort);
+
+			UE_LOG(LogMOUServer, Log, TEXT("[게임포트] %d 확보."), TryPort);
+			return true;
+		}
+
+		Sockets->DestroySocket(Socket);
+	}
+
+	UE_LOG(LogMOUServer, Warning,
+		TEXT("[게임포트] %d~%d 이 전부 사용 중이다. 홀펀칭 없이 진행한다."),
+		BasePort, BasePort + MaxAttempts - 1);
+	return false;
+}
+
+void UServerSubsystem::CloseGameSocket()
+{
+	if (GameSocket == nullptr)
+	{
+		return;
+	}
+
+	if (ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
+	{
+		GameSocket->Close();
+		Sockets->DestroySocket(GameSocket);
+	}
+	GameSocket = nullptr;
+
+	UE_LOG(LogMOUServer, Log, TEXT("[게임포트] %d 를 놓아준다(넷드라이버가 쓸 차례)."), ReservedGamePort);
+}
+
 void UServerSubsystem::BeginReachabilityProbe(int32 Port)
 {
 	if (bProbing)
@@ -1268,44 +1367,14 @@ void UServerSubsystem::BeginReachabilityProbe(int32 Port)
 		return;
 	}
 
-	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
-	if (Sockets == nullptr)
+	if (!EnsureGameSocket(Port))
 	{
-		FinishReachabilityProbe(false, TEXT("소켓 시스템을 찾지 못했습니다."));
-		return;
-	}
-
-	FSocket* Socket = Sockets->CreateSocket(NAME_DGram, TEXT("MOU.Reachability"), FNetworkProtocolTypes::IPv4);
-	if (Socket == nullptr)
-	{
-		FinishReachabilityProbe(false, TEXT("프로브 소켓을 만들지 못했습니다."));
-		return;
-	}
-
-	Socket->SetNonBlocking(true);
-
-	// ★ SetReuseAddr 를 쓰지 않는다.
-	//   윈도우에서 SO_REUSEADDR 는 이미 쓰고 있는 UDP 포트에 두 번째 소켓이
-	//   끼어들 수 있게 만든다. 그러면 들어온 패킷이 둘 중 하나에만 가고,
-	//   프로브는 "안 왔다" 고 오판한다. 이미 쓰는 중이면 bind 가 실패하게 두고
-	//   그 사실을 그대로 알리는 편이 정직하다.
-
-	// 게임 포트 그대로 열어야 의미가 있다. 다른 포트로 확인하면 "그 포트가 열렸다" 만
-	// 알게 되고, 정작 리슨서버가 쓸 포트는 검증되지 않는다.
-	TSharedRef<FInternetAddr> BindAddr = Sockets->CreateInternetAddr();
-	BindAddr->SetAnyAddress();
-	BindAddr->SetPort(Port);
-	if (!Socket->Bind(*BindAddr))
-	{
-		Sockets->DestroySocket(Socket);
-		// 대개 리슨서버나 다른 프로세스가 이미 잡고 있다는 뜻이다.
 		FinishReachabilityProbe(false,
-			FString::Printf(TEXT("포트 %d 를 열지 못했습니다. 이미 다른 프로그램이 쓰고 있습니다."), Port));
+			FString::Printf(TEXT("포트 %d 부근을 열지 못했습니다. 다른 프로그램이 쓰고 있습니다."), Port));
 		return;
 	}
 
-	ProbeSocket       = Socket;
-	ProbePort         = Port;
+	ProbePort         = ReservedGamePort;
 	// 0 은 "아직 없음" 과 구분이 안 되므로 피한다.
 	ProbeNonce        = FMath::Max(1u, static_cast<uint32>(FMath::Rand()) ^ static_cast<uint32>(FPlatformTime::Cycles()));
 	ProbeWaitSeconds  = 0.f;
@@ -1316,12 +1385,12 @@ void UServerSubsystem::BeginReachabilityProbe(int32 Port)
 	UE_LOG(LogMOUServer, Log, TEXT("[프로브] 포트 %d 에서 대기 시작. 서버에 발사를 청한다(nonce %u)."),
 		Port, ProbeNonce);
 
-	Backend->RequestHostProbe(Port, ProbeNonce);
+	Backend->RequestHostProbe(ReservedGamePort, ProbeNonce);
 }
 
 void UServerSubsystem::PollReachabilityProbe(float DeltaTime)
 {
-	if (!bProbing || ProbeSocket == nullptr)
+	if (!bProbing || GameSocket == nullptr)
 	{
 		return;
 	}
@@ -1351,7 +1420,7 @@ void UServerSubsystem::PollReachabilityProbe(float DeltaTime)
 	int32 Read = 0;
 	TSharedRef<FInternetAddr> From = Sockets->CreateInternetAddr();
 
-	while (ProbeSocket->RecvFrom(Buffer, sizeof(Buffer), Read, *From))
+	while (GameSocket->RecvFrom(Buffer, sizeof(Buffer), Read, *From))
 	{
 		if (Read < static_cast<int32>(sizeof(MOU::HostProbeDatagram)))
 		{
@@ -1386,17 +1455,12 @@ void UServerSubsystem::PollReachabilityProbe(float DeltaTime)
 
 void UServerSubsystem::FinishReachabilityProbe(bool bReachable, const FString& Detail)
 {
-	// ★ 소켓을 여기서만 닫는다. 남겨두면 리슨서버가 같은 포트를 못 잡는다.
-	if (ProbeSocket != nullptr)
-	{
-		if (ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM))
-		{
-			ProbeSocket->Close();
-			Sockets->DestroySocket(ProbeSocket);
-		}
-		ProbeSocket = nullptr;
-	}
-
+	// ★ v10 부터 소켓을 여기서 닫지 않는다.
+	//
+	//   게임 포트 소켓은 이제 셋이 공유한다(프로브 / 엔드포인트 등록 / 홀펀칭).
+	//   프로브가 끝났다고 닫아버리면 NAT 에 뚫어둔 구멍이 그 자리에서 사라지고,
+	//   등록해둔 엔드포인트도 무효가 된다. 닫는 것은 여행 직전 한 번뿐이다
+	//   (TravelAsHost / TravelToHost / Deinitialize -> CloseGameSocket).
 	bProbing          = false;
 	bProbeDispatched  = false;
 	ProbeWaitSeconds  = 0.f;
@@ -1421,6 +1485,116 @@ void UServerSubsystem::FinishReachabilityProbe(bool bReachable, const FString& D
 	}
 
 	OnReachabilityChecked.Broadcast(bReachable, Detail);
+}
+
+// ---------------------------------------------------------------------------
+// UDP 홀펀칭 (v10)
+// ---------------------------------------------------------------------------
+
+void UServerSubsystem::RegisterGameEndpoint(int32 BasePort)
+{
+	if (!IsLoggedIn())
+	{
+		return;   // UserId 가 있어야 서버가 어느 세션의 것인지 안다
+	}
+	if (!EnsureGameSocket(BasePort))
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("[엔드포인트] 게임 포트를 확보하지 못해 등록을 건너뛴다. 홀펀칭 없이 진행한다."));
+		return;
+	}
+
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (Sockets == nullptr || GameSocket == nullptr)
+	{
+		return;
+	}
+
+	FString ServerHost;
+	int32   ServerPort = 0;
+	UMOUServerSettings::ResolveEndpoint(ServerHost, ServerPort);
+
+	TSharedRef<FInternetAddr> Dest = Sockets->CreateInternetAddr();
+	bool bValid = false;
+	Dest->SetIp(*ServerHost, bValid);
+	Dest->SetPort(ServerPort);
+	if (!bValid)
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("[엔드포인트] 서버 주소 '%s' 를 IP 로 해석하지 못했다. 등록을 건너뛴다."), *ServerHost);
+		return;
+	}
+
+	// ★ 이 데이터그램의 목적은 내용 전달이 아니라 **출발지를 보이는 것**이다.
+	//   서버는 recvfrom 으로 공인 IP:포트를 관측해서 방장에게 알려준다.
+	//   그래서 주소를 싣지 않는다 — 실으면 위조할 수 있고, 관측값이면 못 한다.
+	MOU::ClientEndpointDatagram Datagram{};
+	Datagram.Magic  = MOU::kClientEndpointMagic;
+	Datagram.Nonce  = FMath::Max(1u, static_cast<uint32>(FMath::Rand()) ^ static_cast<uint32>(FPlatformTime::Cycles()));
+	Datagram.UserId = static_cast<uint64>(GetLoginResult().UserId);
+
+	// UDP 라 한 발은 사라질 수 있다. 세 발 쏘는 값이 재전송 로직보다 훨씬 싸다.
+	int32 Sent = 0;
+	for (int32 i = 0; i < 3; ++i)
+	{
+		GameSocket->SendTo(reinterpret_cast<const uint8*>(&Datagram), sizeof(Datagram), Sent, *Dest);
+	}
+
+	UE_LOG(LogMOUServer, Log,
+		TEXT("[엔드포인트] 포트 %d 에서 서버(%s:%d)로 등록 데이터그램을 보냈다."),
+		ReservedGamePort, *ServerHost, ServerPort);
+}
+
+void UServerSubsystem::PunchTowardPeers()
+{
+	if (PunchTargets.Num() == 0)
+	{
+		return;
+	}
+	if (GameSocket == nullptr)
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("[홀펀칭] 게임 소켓이 없어 punch 를 못 한다. 외부 참여자가 못 들어올 수 있다."));
+		return;
+	}
+
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (Sockets == nullptr)
+	{
+		return;
+	}
+
+	// 내용은 아무래도 좋다. NAT 에 "이 상대와 이야기 중" 이라는 자국을 남기는 것이
+	// 전부다. 상대는 이것을 받지 못해도 상관없다 — 상대 NAT 이 막아도 우리 쪽
+	// 구멍은 이미 뚫렸고, 필요한 것은 그것뿐이다.
+	const MOU::HostProbeDatagram Payload{ MOU::kHostProbeMagic, 0 };
+
+	for (const FMOUHostCandidate& Target : PunchTargets)
+	{
+		if (!Target.IsValid())
+		{
+			continue;
+		}
+
+		TSharedRef<FInternetAddr> Dest = Sockets->CreateInternetAddr();
+		bool bValid = false;
+		Dest->SetIp(*Target.Address, bValid);
+		Dest->SetPort(Target.Port);
+		if (!bValid)
+		{
+			continue;
+		}
+
+		// 여러 발 쏘는 이유는 유실 대비와, 상대가 아직 소켓을 안 열었을 때를 위해서다.
+		int32 Sent = 0;
+		for (int32 i = 0; i < 5; ++i)
+		{
+			GameSocket->SendTo(reinterpret_cast<const uint8*>(&Payload), sizeof(Payload), Sent, *Dest);
+		}
+
+		UE_LOG(LogMOUServer, Log, TEXT("[홀펀칭] %s:%d 로 구멍을 뚫었다."),
+			*Target.Address, Target.Port);
+	}
 }
 
 FString UServerSubsystem::GetLocalLanAddress()
@@ -1559,6 +1733,14 @@ void UServerSubsystem::TravelAsHost()
 		FinishReachabilityProbe(false, TEXT("게임이 먼저 시작되어 확인을 마치지 못했습니다."));
 	}
 
+	// ★ 순서가 중요하다: punch 를 **먼저**, 소켓 닫기를 그 다음.
+	//
+	//   punch 는 게임 포트에 bind 된 이 소켓에서 나가야 NAT 구멍이 그 포트에 뚫린다.
+	//   소켓을 먼저 닫으면 쏠 곳이 없고, 리슨서버가 연 소켓으로 나중에 쏘면
+	//   그때는 이미 참여자가 접속을 시도한 뒤다.
+	PunchTowardPeers();
+	CloseGameSocket();
+
 	// listen 옵션이 있어야 이 클라이언트가 리슨서버가 된다.
 	// RoomPassword 를 URL 에 같이 실어야 새 레벨의 GameMode 가 InitGame 에서
 	// 그 값을 읽어 보관하고, 나중에 PreLogin 에서 참여자를 검사할 수 있다.
@@ -1621,6 +1803,11 @@ bool UServerSubsystem::TravelToHost()
 	UE_LOG(LogMOUServer, Log, TEXT("[참여자] 후보 %d개 중 %s 선택 (전체: %s)"),
 		PendingHostReady.Candidates.Num(), *Chosen.ToDisplayString(),
 		*PendingHostReady.ToDisplayString());
+
+	// ★ 넷드라이버가 같은 포트를 잡아야 한다. 우리가 들고 있으면 bind 가 실패하고,
+	//   그러면 엔진이 임시 포트로 떨어져 방장이 뚫어둔 구멍을 못 쓰게 된다.
+	//   (UMOUIpNetDriver 가 ReservedGamePort 를 쓰도록 이미 설정돼 있다)
+	CloseGameSocket();
 
 	// 어디로 떠나는지 남겨둔다. 접속에 실패하면 그 주소를 그대로 넣어
 	// "어디에 못 붙었는지" 를 말해줄 수 있다.

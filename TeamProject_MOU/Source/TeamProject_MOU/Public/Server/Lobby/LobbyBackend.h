@@ -118,7 +118,10 @@ enum class EServerClientEventType : uint8
 	 * 호스트는 이 신호를 받은 뒤부터 시간을 센다. 서버가 쏘기 전부터 세면
 	 * 왕복 지연만큼 손해를 보고, 서버가 못 쐈는데 기다리는 일도 생긴다.
 	 */
-	HostProbeSent
+	HostProbeSent,
+
+	/** 서버가 내 공인 게임 엔드포인트를 관측해 알려줬다. Detail 에 "IP:포트". (v10) */
+	ClientEndpointAck
 };
 
 /**
@@ -151,6 +154,9 @@ struct FServerClientEvent
 	/** Type == HostProbeSent 일 때만 유효 (v9) */
 	uint32 ProbeNonce  = 0;
 	bool   bProbeSent  = false;
+
+	/** Type == RoomStart 일 때만 유효. 방장이 punch 할 대상들 (v10) */
+	TArray<FMOUHostCandidate> PunchTargets;
 
 	/**
 	 * Type == RoomMemberList 일 때만 유효.

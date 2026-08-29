@@ -131,6 +131,119 @@ namespace
 		return Sent == static_cast<int>(sizeof(Datagram));
 	}
 
+	/**
+	 * 참여자가 보낸 등록 데이터그램을 처리한다. (v10)
+	 *
+	 * 이 함수의 존재 이유가 곧 홀펀칭의 전부다 — 방장은 참여자의 공인 게임
+	 * 엔드포인트를 알 방법이 없고(그 패킷 자체가 방장의 NAT 에서 막힌다),
+	 * 바깥에 있으면서 양쪽과 이미 이야기하고 있는 것은 이 서버뿐이다.
+	 *
+	 * ★ 주소는 **관측값**이다. 데이터그램 안에는 UserId 만 들어 있고 주소는 없다.
+	 *   그래도 UserId 는 위조할 수 있으므로, TCP 세션의 공인 IP 와 다르면 버린다.
+	 *   그러면 남을 엉뚱한 곳으로 punch 하게 만들 수 없다.
+	 */
+	void HandleClientEndpointDatagram(const ClientEndpointDatagram& Datagram,
+	                                  const sockaddr_in& From)
+	{
+		char AddrText[INET_ADDRSTRLEN] = {};
+		if (::inet_ntop(AF_INET, &From.sin_addr, AddrText, sizeof(AddrText)) == nullptr)
+		{
+			return;
+		}
+		const std::string SourceAddress = AddrText;
+		const uint16_t    SourcePort    = ::ntohs(From.sin_port);
+
+		SessionPtr Target;
+		GSessions.ForEach([&](const SessionPtr& Session)
+		{
+			if (Session->bAuthed && Session->UserId == Datagram.UserId)
+			{
+				Target = Session;
+			}
+		});
+
+		if (!Target)
+		{
+			std::printf("[엔드포인트] 모르는 UserId %llu 의 등록을 버린다 (%s:%u)\n",
+			            static_cast<unsigned long long>(Datagram.UserId),
+			            SourceAddress.c_str(), SourcePort);
+			return;
+		}
+
+		// ★ 위조 차단. 남의 UserId 를 적어 보내면 여기서 걸린다 —
+		//   그 사람의 TCP 연결은 다른 IP 에서 오고 있기 때문이다.
+		if (Target->PeerAddress != SourceAddress)
+		{
+			std::printf("[거부] 엔드포인트 등록의 출발지가 세션과 다르다: %s (세션은 %s)\n",
+			            SourceAddress.c_str(), Target->PeerAddress.c_str());
+			return;
+		}
+
+		Target->GameEndpointAddress = SourceAddress;
+		Target->GameEndpointPort    = SourcePort;
+
+		std::printf("[엔드포인트] %s(%llu) 의 게임 주소를 %s:%u 로 관측했다\n",
+		            Target->Name.c_str(),
+		            static_cast<unsigned long long>(Target->UserId),
+		            SourceAddress.c_str(), SourcePort);
+
+		ClientEndpointAckBody Ack{};
+		Ack.Nonce     = Datagram.Nonce;
+		Ack.Port      = SourcePort;
+		Ack.bObserved = 1;
+		CopyFixedString(Ack.Address, kMaxAddressLen, SourceAddress);
+		SendPacket(Target->Sock, EOpcode::ClientEndpointAck, &Ack, sizeof(Ack));
+	}
+
+	/**
+	 * 프로브 소켓으로 들어오는 UDP 를 계속 읽는다. 전용 스레드에서 돈다.
+	 *
+	 * 지금 들어오는 것은 참여자의 엔드포인트 등록 하나뿐이다.
+	 * (프로브 응답은 UDP 가 아니라 호스트가 TCP 로 신고한다 — 서버는 쏘기만 했다)
+	 */
+	void UdpReceiveLoop()
+	{
+		std::printf("[UDP] 엔드포인트 수신 스레드 시작\n");
+
+		while (GRunning)
+		{
+			char Buffer[512];
+			sockaddr_in From{};
+			socklen_t   FromLen = sizeof(From);
+
+			const int Read = ::recvfrom(GProbeSock, Buffer, static_cast<int>(sizeof(Buffer)), 0,
+			                            reinterpret_cast<sockaddr*>(&From), &FromLen);
+			if (Read < 0)
+			{
+				if (IsRecvTimeout(LastNetError()))
+				{
+					continue;   // 타임아웃은 정상이다. GRunning 을 다시 보라는 뜻일 뿐
+				}
+				if (!GRunning)
+				{
+					break;
+				}
+				continue;
+			}
+
+			if (Read < static_cast<int>(sizeof(ClientEndpointDatagram)))
+			{
+				continue;   // 우리 것이 아니다
+			}
+
+			ClientEndpointDatagram Datagram{};
+			std::memcpy(&Datagram, Buffer, sizeof(Datagram));
+			if (Datagram.Magic != kClientEndpointMagic)
+			{
+				continue;
+			}
+
+			HandleClientEndpointDatagram(Datagram, From);
+		}
+
+		std::printf("[UDP] 엔드포인트 수신 스레드 종료\n");
+	}
+
 	/** HostCandidate 하나를 채운다. 주소가 비었거나 너무 길면 아무것도 하지 않고 false. */
 	bool PushCandidate(std::vector<HostCandidate>& Out, const std::string& Address,
 	                   uint16_t Port, EHostAddrKind Kind)
@@ -1089,6 +1202,47 @@ namespace
 		Start.CandidateCount = FillCandidates(Start.Candidates, Candidates);
 		Start.bLanOnly       = bLanOnly ? 1 : 0;
 
+		// ★ 홀펀칭 대상: 방장을 뺀 참여자들의 **관측된** 공인 게임 엔드포인트. (v10)
+		//   방장은 OpenLevel 직전에 이 주소들로 한 발씩 쏴서 자기 NAT 에 구멍을 낸다.
+		//   등록을 안 한 참여자는 여기 안 들어간다 — 그 사람은 예전처럼 붙어야 하고,
+		//   방장 네트워크가 인바운드를 받는 경우에만 성공한다.
+		{
+			uint8_t PunchCount = 0;
+			GSessions.ForEach([&](const SessionPtr& Member)
+			{
+				if (PunchCount >= kMaxPlayersInRoom || Member->UserId == Session->UserId)
+				{
+					return;
+				}
+				if (Member->GameEndpointPort == 0 || Member->GameEndpointAddress.empty())
+				{
+					return;
+				}
+				// 이 방의 멤버만. Recipients 에 방장도 들어 있어 위에서 걸렀다.
+				bool bInThisRoom = false;
+				for (const uint64_t Id : Recipients)
+				{
+					if (Id == Member->UserId) { bInThisRoom = true; break; }
+				}
+				if (!bInThisRoom)
+				{
+					return;
+				}
+
+				PeerEndpoint& Target = Start.PunchTargets[PunchCount++];
+				CopyFixedString(Target.Address, kMaxAddressLen, Member->GameEndpointAddress);
+				Target.Port = Member->GameEndpointPort;
+			});
+			Start.PunchTargetCount = PunchCount;
+
+			std::printf("[게임 시작]   홀펀칭 대상 %u명\n", static_cast<unsigned>(PunchCount));
+			for (uint8_t i = 0; i < PunchCount; ++i)
+			{
+				std::printf("[게임 시작]     %s:%u\n",
+				            Start.PunchTargets[i].Address, Start.PunchTargets[i].Port);
+			}
+		}
+
 		SendToUsers(Recipients, EOpcode::RoomStart, &Start, sizeof(Start), nullptr, 0);
 
 		// ★ 방이 InGame 이 됐으므로 이 방 사람들의 친구에게 "게임중" 을 알린다 (M4).
@@ -1931,6 +2085,36 @@ int main(int argc, char** argv)
 		std::printf("[경고] 프로브용 UDP 소켓을 못 만들었다(%d). 도달성 확인 없이 진행한다.\n",
 		            LastNetError());
 	}
+	else
+	{
+		// ★ v10 부터는 bind 한다. 보내기만 하던 소켓이 이제 **받기도** 해야 한다 —
+		//   참여자가 자기 게임 포트에서 등록 데이터그램을 쏘고, 서버는 그 출발지를
+		//   관측해 방장에게 알려준다. 그것이 홀펀칭의 유일한 단서다.
+		//
+		//   TCP 와 같은 번호를 쓴다. 프로토콜이 다르므로 충돌하지 않고,
+		//   팀이 외울 포트가 하나로 유지된다.
+		//
+		// ★★ 공유기에 **외부 UDP <port> -> 서버 PC** 포워딩이 필요하다.
+		//    TCP 만 열려 있으면 등록 데이터그램이 서버까지 오지 못하고,
+		//    그러면 홀펀칭이 통째로 동작하지 않는다.
+		sockaddr_in ProbeAddr{};
+		ProbeAddr.sin_family      = AF_INET;
+		ProbeAddr.sin_addr.s_addr = ::htonl(INADDR_ANY);
+		ProbeAddr.sin_port        = ::htons(static_cast<uint16_t>(std::atoi(PortArg)));
+
+		if (::bind(GProbeSock, reinterpret_cast<sockaddr*>(&ProbeAddr), sizeof(ProbeAddr)) != 0)
+		{
+			std::printf("[경고] UDP %s 를 열지 못했다(%d). 홀펀칭 없이 진행한다.\n",
+			            PortArg, LastNetError());
+		}
+		else
+		{
+			// 타임아웃이 있어야 종료할 때 recvfrom 에 갇히지 않는다.
+			SetRecvTimeout(GProbeSock, 500);
+			std::printf("[UDP] %s 에서 엔드포인트 등록을 받는다.\n", PortArg);
+			std::printf("      * 공유기에 '외부 UDP %s -> 이 PC' 포워딩이 있어야 한다.\n", PortArg);
+		}
+	}
 
 	sockaddr_in ServerAddr{};
 	ServerAddr.sin_family      = AF_INET;
@@ -2036,6 +2220,14 @@ int main(int argc, char** argv)
 
 	std::printf("=== MOU 서버 시작 (port %s) ===\n", PortArg);
 
+	// 엔드포인트 등록 수신. accept 루프와 독립적이라 별도 스레드가 맞다. (v10)
+	// GRunning 이 꺼지면 recvfrom 타임아웃(500ms) 다음 바퀴에 스스로 빠져나온다.
+	std::thread UdpThread;
+	if (GProbeSock != kInvalidSocket)
+	{
+		UdpThread = std::thread(UdpReceiveLoop);
+	}
+
 	while (GRunning)
 	{
 		sockaddr_in ClientAddr{};
@@ -2063,6 +2255,18 @@ int main(int argc, char** argv)
 		// 방을 만들 때 호스트 주소로 쓸 값이다. 여기서 한 번만 확정해둔다.
 		Session->PeerAddress = AddrText;
 		std::thread(ClientThread, Session).detach();
+	}
+
+	// UDP 스레드를 먼저 거둔다. 소켓을 닫기 전에 빠져나와야 이미 닫힌 핸들로
+	// recvfrom 을 부르는 일이 없다.
+	if (UdpThread.joinable())
+	{
+		UdpThread.join();
+	}
+	if (GProbeSock != kInvalidSocket)
+	{
+		CloseSocket(GProbeSock);
+		GProbeSock = kInvalidSocket;
 	}
 
 	ChatLog::Stop();

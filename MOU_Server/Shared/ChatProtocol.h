@@ -40,7 +40,13 @@ namespace MOU
 	//            이제 서버가 호스트에게 UDP 를 한 발 쏴서 실제로 받아지는지 확인하고,
 	//            안 되면 그 방을 "같은 LAN 전용" 으로 표시한다. 참여자는 죽은 주소로
 	//            달려가는 대신 그 자리에서 사유를 본다.
-	constexpr uint16_t kProtocolVersion = 9;
+	//   9 -> 10: UDP 홀펀칭 추가. 참여자 쪽 공유기가 port-restricted cone 이라,
+	//            방장이 참여자의 **정확한 공인 IP:포트** 로 먼저 한 발 쏘면 그 구멍으로
+	//            접속이 들어온다는 것을 실측으로 확인했다(같은 포트 답장은 즉시 통과,
+	//            다른 포트 답장은 10발 중 0발). 방장은 참여자의 엔드포인트를 알 수
+	//            없으므로 서버가 UDP 로 관측해 RoomStart 에 실어 내려준다.
+	//            이것으로 릴레이 없이 "누구나 호스트" 가 된다.
+	constexpr uint16_t kProtocolVersion = 10;
 
 	// BodySize 가 이 값을 넘으면 악성 패킷으로 보고 연결을 끊는다.
 	constexpr uint32_t kMaxBodySize = 4096;
@@ -203,6 +209,56 @@ namespace MOU
 		HostProbeReq        = 40,  // C->S. "내 공인주소:이 포트로 UDP 한 발 쏴달라"
 		HostProbeSent       = 41,  // S->C. "쐈다" (또는 못 쐈다). 호스트는 이때부터 센다
 		RoomReachabilityReq = 42,  // C->S. "내 방은 외부에서 들어올 수 있다/없다"
+
+		// --- UDP 홀펀칭 (v10) ---
+		//
+		// [무엇을 푸는가]
+		//   실측 결과 참여자 쪽 공유기는 **port-restricted cone** 이다:
+		//     · 정적 포워딩으로 들어오는 미요청 인바운드 -> 차단
+		//     · 자기가 먼저 쏜 상대의 **같은 포트**에서 오는 것 -> 통과
+		//     · 같은 상대라도 **다른 포트**에서 오면 -> 차단 (10발 중 0발)
+		//
+		//   그래서 방장이 참여자의 **정확한 공인 IP:포트** 로 미리 한 발 쏴두면,
+		//   그 구멍으로 참여자의 접속이 들어온다. 릴레이가 필요 없다.
+		//
+		// [왜 서버가 관여하는가]
+		//   방장은 참여자의 공인 엔드포인트를 알 수 없다. 참여자가 방장에게 직접
+		//   알려주려 해도 그 패킷 자체가 방장의 NAT 에서 막힌다(닭과 달걀).
+		//   바깥에 있으면서 양쪽과 이미 이야기하고 있는 것은 서버뿐이다.
+		//
+		// ★ 엔드포인트는 **관측값**이다. 클라이언트가 신고하지 않는다 —
+		//   호스트 공인 주소를 accept() 에서 읽는 것과 같은 원칙이다.
+		ClientEndpointAck   = 43,  // S->C. "네 공인 엔드포인트를 이렇게 봤다"
+	};
+
+	/**
+	 * 참여자가 서버의 UDP 포트로 쏘는 등록 데이터그램. (v10)
+	 *
+	 * TCP 프레이밍을 타지 않는 생 UDP 다 — 그래야 서버가 **출발지 주소를 관측**할 수 있다.
+	 * TCP 로 보내면 그 스트림의 주소만 알게 되고, 정작 필요한 게임 포트는 알 수 없다.
+	 *
+	 * UserId 를 싣는 이유: 서버가 이 데이터그램을 어느 세션에 붙일지 알아야 한다.
+	 * 위조가 가능하지만 피해가 없다 — 남의 UserId 를 적으면 그 사람의 엔드포인트가
+	 * **내 주소로** 잘못 기록되어 정작 공격자에게 punch 가 갈 뿐이다.
+	 * (그래도 걸러내려고 서버는 TCP 세션의 공인 IP 와 일치하는지 확인한다)
+	 */
+	struct ClientEndpointDatagram
+	{
+		uint32_t Magic;     // kClientEndpointMagic
+		uint32_t Nonce;     // 클라이언트가 정한다. Ack 와 짝을 맞춘다
+		uint64_t UserId;    // 어느 세션의 것인가
+	};
+
+	/** "MOUE". 등록 데이터그램을 프로브(MOUP)와 구분한다. */
+	constexpr uint32_t kClientEndpointMagic = 0x4D4F5545u;
+
+	struct ClientEndpointAckBody
+	{
+		uint32_t Nonce;
+		char     Address[kMaxAddressLen];   // 서버가 관측한 공인 IP
+		uint16_t Port;                      // 서버가 관측한 공인 포트
+		uint8_t  bObserved;                 // 0 이면 아직 등록 데이터그램을 못 받았다
+		uint8_t  Reserved;
 	};
 
 	/**
@@ -576,6 +632,19 @@ namespace MOU
 	// 방을 만들 때가 아니라 여기서 주소를 다시 내려주는 이유:
 	//   참여 시점과 시작 시점 사이에 호스트가 포트를 바꿨을 수도 있고,
 	//   무엇보다 "지금 떠나도 된다" 는 신호가 주소와 함께 오는 편이 명확하다.
+	/**
+	 * 홀펀칭 대상 하나. 서버가 UDP 로 **관측한** 참여자의 공인 엔드포인트다. (v10)
+	 *
+	 * 방장이 이 주소로 미리 한 발 쏘면 자기 NAT 에 구멍이 뚫리고,
+	 * 그 뒤 참여자의 접속이 그 구멍으로 들어온다.
+	 */
+	struct PeerEndpoint
+	{
+		char     Address[kMaxAddressLen];
+		uint16_t Port;
+		uint8_t  Reserved[2];
+	};
+
 	struct RoomStartBody
 	{
 		uint32_t      RoomId;
@@ -583,6 +652,15 @@ namespace MOU
 		uint8_t       CandidateCount;
 		uint8_t       bLanOnly;                        // 1 이면 같은 LAN 에서만 들어올 수 있다 (v9)
 		uint8_t       Reserved[2];
+
+		// --- 홀펀칭 (v10) ---
+		//
+		// ★ 방장에게만 의미가 있다. 참여자도 같은 패킷을 받지만 무시하면 된다 —
+		//   패킷을 두 종류로 가르는 것보다 한 종류를 두 쪽이 다르게 읽는 편이
+		//   서버 코드가 단순하다(이미 bIsHost 로 갈리고 있다).
+		PeerEndpoint  PunchTargets[kMaxPlayersInRoom];
+		uint8_t       PunchTargetCount;
+		uint8_t       Reserved2[3];
 	};
 
 	/**
@@ -790,7 +868,10 @@ namespace MOU
 	static_assert(sizeof(RoomMemberListBody) ==  6, "RoomMemberListBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomReadyReqBody)   ==  1, "RoomReadyReqBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomClosedBody)     ==  5, "RoomClosedBody 에 패딩이 끼었다");
-	static_assert(sizeof(RoomStartBody)      == 68, "RoomStartBody 에 패딩이 끼었다");
+	static_assert(sizeof(PeerEndpoint)           == 20, "PeerEndpoint 에 패딩이 끼었다");
+	static_assert(sizeof(RoomStartBody)      == 152, "RoomStartBody 에 패딩이 끼었다");
+	static_assert(sizeof(ClientEndpointDatagram) == 16, "ClientEndpointDatagram 에 패딩이 끼었다");
+	static_assert(sizeof(ClientEndpointAckBody)  == 24, "ClientEndpointAckBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomHostReadyBody)  == 68, "RoomHostReadyBody 에 패딩이 끼었다");
 	static_assert(sizeof(HostProbeDatagram)     == 8, "HostProbeDatagram 에 패딩이 끼었다");
 	static_assert(sizeof(HostProbeReqBody)      == 8, "HostProbeReqBody 에 패딩이 끼었다");

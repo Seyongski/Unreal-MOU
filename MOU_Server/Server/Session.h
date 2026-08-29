@@ -35,6 +35,18 @@ namespace MOU
 		std::string PeerAddress;
 
 		/**
+		 * 서버가 UDP 로 **관측한** 이 클라이언트의 공인 게임 엔드포인트. (v10)
+		 *
+		 * 홀펀칭 대상이다. 방장이 이 주소로 미리 한 발 쏘면 자기 NAT 에 구멍이 뚫리고,
+		 * 그 뒤 이 참여자의 접속이 그 구멍으로 들어온다.
+		 *
+		 * ★ 클라이언트가 신고한 값이 아니라 recvfrom 으로 읽은 값이다.
+		 *   신고를 믿으면 남을 엉뚱한 곳으로 punch 하게 만들 수 있다.
+		 */
+		std::string GameEndpointAddress;
+		uint16_t    GameEndpointPort = 0;
+
+		/**
 		 * 이 사람이 마지막으로 신고한 도달성 결과. (v9)
 		 *
 		 * [왜 세션에 두는가 — 순서 때문이다]
