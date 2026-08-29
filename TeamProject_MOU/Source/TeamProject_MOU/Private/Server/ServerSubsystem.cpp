@@ -865,12 +865,12 @@ bool UServerSubsystem::Tick(float DeltaTime)
 				// 그 순간 로비 위젯은 파괴되므로, 위젯이 감시를 맡으면 감시자가 사라진다.
 				bWaitingForListenServer = true;
 				ListenServerWaitSeconds = 0.f;
-			}
 
-				// 방장이 punch 할 대상. OpenLevel 직전에 쓴다.
+				// 방장이 punch 할 대상. OpenLevel 직전에 쓴다. (v10)
 				PunchTargets = Event.PunchTargets;
 				UE_CLOG(PunchTargets.Num() > 0, LogMOUServer, Log,
 					TEXT("[홀펀칭] 참여자 %d명의 주소를 받았다."), PunchTargets.Num());
+			}
 			else
 			{
 				// 참여자는 지금부터 출발 신호를 기다린다. 끝없이 기다리지는 않는다.
@@ -1493,9 +1493,10 @@ void UServerSubsystem::FinishReachabilityProbe(bool bReachable, const FString& D
 
 void UServerSubsystem::RegisterGameEndpoint(int32 BasePort)
 {
-	if (!IsLoggedIn())
+	// UserId 가 있어야 서버가 이 데이터그램을 어느 세션에 붙일지 안다.
+	if (!LoginResult.bSuccess || LoginResult.UserId == 0)
 	{
-		return;   // UserId 가 있어야 서버가 어느 세션의 것인지 안다
+		return;
 	}
 	if (!EnsureGameSocket(BasePort))
 	{
@@ -1531,7 +1532,7 @@ void UServerSubsystem::RegisterGameEndpoint(int32 BasePort)
 	MOU::ClientEndpointDatagram Datagram{};
 	Datagram.Magic  = MOU::kClientEndpointMagic;
 	Datagram.Nonce  = FMath::Max(1u, static_cast<uint32>(FMath::Rand()) ^ static_cast<uint32>(FPlatformTime::Cycles()));
-	Datagram.UserId = static_cast<uint64>(GetLoginResult().UserId);
+	Datagram.UserId = static_cast<uint64>(LoginResult.UserId);
 
 	// UDP 라 한 발은 사라질 수 있다. 세 발 쏘는 값이 재전송 로직보다 훨씬 싸다.
 	int32 Sent = 0;
