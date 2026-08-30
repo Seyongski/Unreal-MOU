@@ -1785,10 +1785,20 @@ bool UServerSubsystem::TravelToHost()
 		return false;
 	}
 
-	// ★ 방장이 도달성 프로브에 실패했는데 내가 공인 후보를 골랐다면, 이 접속은
-	//   **반드시** 실패한다. 시도하면 핸드셰이크 타임아웃까지 1분 가까이 화면이
-	//   멈춘 뒤에야 같은 결론에 도달한다. 아는 것을 굳이 확인하지 않는다.
-	if (PendingHostReady.bLanOnly && Chosen.Kind != EMOUHostAddrKindBP::Lan)
+	// ★ 방장이 도달성 프로브에 실패했는데 내가 공인 후보를 골랐다면, 예전에는
+	//   이 접속이 **반드시** 실패했다. 그래서 시도하지 않고 바로 사유를 띄웠다.
+	//
+	// [v10 에서 조건이 하나 붙었다]
+	//   홀펀칭은 바로 그 "미요청 인바운드가 막힌" 경우를 뚫는 기법이다.
+	//   내가 엔드포인트를 등록했다면 방장이 나에게 punch 했을 것이고, 그러면
+	//   막혀 있던 길이 열려 있을 수 있다. 그때는 시도해봐야 한다 —
+	//   여기서 막으면 5단계가 고치려는 경우를 4단계가 막아서는 꼴이 된다.
+	//   (실제로 그 충돌 때문에 punch 가 시도조차 안 됐다)
+	//
+	//   등록을 못 했으면 방장은 나에게 쏠 곳을 몰랐다는 뜻이므로 예전대로 즉시 실패한다.
+	const bool bMayHavePunchedHole = !ObservedEndpoint.IsEmpty();
+
+	if (PendingHostReady.bLanOnly && Chosen.Kind != EMOUHostAddrKindBP::Lan && !bMayHavePunchedHole)
 	{
 		const FString Reason = TEXT(
 			"이 방은 같은 공유기 안에서만 참여할 수 있습니다.\n"

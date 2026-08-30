@@ -295,6 +295,34 @@ ERoomResult SetReady(uint64_t UserId, bool bReady, uint32_t& OutRoomId)
 	return ERoomResult::NotInRoom;
 }
 
+void UpdateHostEndpoint(uint64_t HostUserId, const std::string& Address, uint16_t Port)
+{
+	if (Address.empty() || Port == 0)
+	{
+		return;
+	}
+
+	std::lock_guard<std::mutex> Lock(GMutex);
+
+	Room* R = FindRoomOfMember(HostUserId);
+	if (R == nullptr || R->HostUserId != HostUserId)
+	{
+		return;   // 방장이 아니면 방 주소를 고칠 이유가 없다
+	}
+
+	// 공인 후보를 관측값으로 덮는다. 사설(LAN) 후보는 그대로 둔다 —
+	// 같은 공유기 안의 참여자에게는 그쪽이 여전히 맞는 길이다.
+	for (HostCandidate& C : R->Candidates)
+	{
+		if (C.Kind == static_cast<uint8_t>(EHostAddrKind::Public))
+		{
+			CopyFixedString(C.Address, kMaxAddressLen, Address);
+			C.Port = Port;
+			return;
+		}
+	}
+}
+
 ERoomResult SetReachability(uint64_t HostUserId, bool bReachable, uint32_t& OutRoomId)
 {
 	OutRoomId = 0;

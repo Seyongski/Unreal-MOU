@@ -145,6 +145,20 @@ namespace MOU
 		ERoomResult SetReachability(uint64_t HostUserId, bool bReachable, uint32_t& OutRoomId);
 
 		/**
+		 * 서버가 관측한 방장의 공인 게임 엔드포인트로 방의 공인 후보를 갱신한다. (v10)
+		 *
+		 * [왜 나중에 고치는가 — 순서 때문이다]
+		 *   엔드포인트 등록은 대기실에 들어간 뒤에 일어나므로 **방 생성보다 늦다.**
+		 *   방을 만들 때는 UPnP 가 알려준 포트로 공인 후보를 적어두는데, 그 포트는
+		 *   홀펀칭으로 실제 뚫리는 구멍과 다를 수 있다 — UPnP 정적 매핑이 그 번호를
+		 *   점유하면 동적 흐름은 다른 번호를 받기 때문이다(실측: 7777 vs 1035).
+		 *
+		 *   관측값이 들어오면 그것으로 덮는다. 참여자가 붙어야 하는 곳은
+		 *   "UPnP 가 열었다고 말한 포트" 가 아니라 "실제로 구멍이 뚫린 포트" 다.
+		 */
+		void UpdateHostEndpoint(uint64_t HostUserId, const std::string& Address, uint16_t Port);
+
+		/**
 		 * 방의 현재 멤버 명단을 뜬다. RoomMemberList 를 만들 때 쓴다.
 		 *
 		 * @param OutNotifyUserIds 이 명단을 받아야 할 사람들 (= 멤버 전원)

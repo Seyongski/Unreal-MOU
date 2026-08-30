@@ -150,7 +150,12 @@ namespace
 		{
 			return;
 		}
-		const std::string SourceAddress = AddrText;
+		// ★ 방 주소와 같은 규칙을 여기에도 건다.
+		//   서버와 같은 공유기 안에 있는 사람은 출발지가 사설 주소(대개 게이트웨이)로
+		//   보인다. 그 값을 그대로 punch 대상으로 넘기면 방장은 자기 LAN 의 엉뚱한
+		//   기기로 쏘게 되고, 구멍은 아무 데도 안 뚫린다.
+		//   실제로 Player1 의 엔드포인트가 192.168.35.1 로 관측되고 있었다.
+		const std::string SourceAddress = ResolveHostAddress(AddrText);
 		const uint16_t    SourcePort    = ::ntohs(From.sin_port);
 
 		SessionPtr Target;
@@ -172,7 +177,7 @@ namespace
 
 		// ★ 위조 차단. 남의 UserId 를 적어 보내면 여기서 걸린다 —
 		//   그 사람의 TCP 연결은 다른 IP 에서 오고 있기 때문이다.
-		if (Target->PeerAddress != SourceAddress)
+		if (ResolveHostAddress(Target->PeerAddress) != SourceAddress)
 		{
 			std::printf("[거부] 엔드포인트 등록의 출발지가 세션과 다르다: %s (세션은 %s)\n",
 			            SourceAddress.c_str(), Target->PeerAddress.c_str());
@@ -181,6 +186,14 @@ namespace
 
 		Target->GameEndpointAddress = SourceAddress;
 		Target->GameEndpointPort    = SourcePort;
+
+		// ★ 이 사람이 방장이면 방의 공인 후보를 관측값으로 덮는다. (v10)
+		//
+		//   방을 만들 때 적은 공인 후보는 UPnP 가 알려준 포트다. 그런데 홀펀칭으로
+		//   실제 뚫리는 구멍은 **동적 바인딩의 포트**이고, UPnP 정적 매핑이 그 번호를
+		//   점유하고 있으면 둘이 달라진다(실측: UPnP 있을 때 1035, 없을 때 7777).
+		//   참여자가 붙어야 하는 곳은 뚫린 쪽이다.
+		Rooms::UpdateHostEndpoint(Target->UserId, SourceAddress, SourcePort);
 
 		std::printf("[엔드포인트] %s(%llu) 의 게임 주소를 %s:%u 로 관측했다\n",
 		            Target->Name.c_str(),
