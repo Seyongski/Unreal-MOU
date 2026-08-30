@@ -162,7 +162,7 @@ enum class EMOUHostAddrKindBP : uint8
 {
 	Public = 0   UMETA(DisplayName = "공인"),
 	Lan    = 1   UMETA(DisplayName = "같은 LAN"),
-	Relay  = 2   UMETA(DisplayName = "릴레이"),
+	Punch  = 2   UMETA(DisplayName = "홀펀칭"),
 };
 
 /**
@@ -210,7 +210,7 @@ struct FMOUHostCandidate
 	{
 		const TCHAR* KindText =
 			(Kind == EMOUHostAddrKindBP::Lan)   ? TEXT("LAN")   :
-			(Kind == EMOUHostAddrKindBP::Relay) ? TEXT("릴레이") : TEXT("공인");
+			(Kind == EMOUHostAddrKindBP::Punch) ? TEXT("홀펀칭") : TEXT("공인");
 		return FString::Printf(TEXT("%s:%d(%s)"), *Address, Port, KindText);
 	}
 };

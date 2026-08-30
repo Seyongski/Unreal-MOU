@@ -393,7 +393,7 @@ public:
 	 * @param OutIndex 고른 후보의 인덱스. 실패 시 INDEX_NONE
 	 * @return 고른 후보. 유효하지 않으면 후보가 하나도 쓸만하지 않다는 뜻이다
 	 */
-	static FMOUHostCandidate ChooseHostCandidate(const TArray<FMOUHostCandidate>& Candidates, int32& OutIndex);
+	static FMOUHostCandidate ChooseHostCandidate(const TArray<FMOUHostCandidate>& Candidates, bool bHostLanOnly, int32& OutIndex);
 
 	/**
 	 * 마지막에 쓴 후보가 실패했을 때 다음 후보로 다시 붙어본다. (v8)

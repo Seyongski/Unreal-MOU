@@ -1626,7 +1626,7 @@ FString UServerSubsystem::GetLocalLanAddress()
 	return Address;
 }
 
-FMOUHostCandidate UServerSubsystem::ChooseHostCandidate(const TArray<FMOUHostCandidate>& Candidates, int32& OutIndex)
+FMOUHostCandidate UServerSubsystem::ChooseHostCandidate(const TArray<FMOUHostCandidate>& Candidates, bool bHostLanOnly, int32& OutIndex)
 {
 	OutIndex = INDEX_NONE;
 
@@ -1676,17 +1676,36 @@ FMOUHostCandidate UServerSubsystem::ChooseHostCandidate(const TArray<FMOUHostCan
 		}
 	}
 
-	// 2순위: 공인 후보.
-	for (int32 Index = 0; Index < Candidates.Num(); ++Index)
+	// 2·3순위: 공인 후보와 홀펀칭 후보. **어느 쪽을 먼저 볼지는 방의 상태가 정한다.**
+	//
+	//   bHostLanOnly=false : 방장이 정적으로 열려 있다(포워딩/UPnP). 그 길이 확실하다.
+	//                        Punch 는 구멍이 제때 뚫렸는지에 달려 있어 덜 확실하다.
+	//   bHostLanOnly=true  : 프로브가 "정적 인바운드는 죽었다" 고 판정했다.
+	//                        공인 후보를 먼저 시도하면 타임아웃을 통째로 버린다.
+	//
+	// ★ 이 순서를 고정으로 두면 반드시 한쪽이 깨진다.
+	//   실제로 관측 포트로 공인 후보를 **덮었다가** 수동 포워딩 방장(잘 되던 조합)을
+	//   깼다 — 그 포트에는 포워딩이 없어서 아무도 못 들어왔다.
+	//   두 길은 성격이 다르므로 둘 다 남기고, 고르는 기준만 상태에 맡긴다.
+	const EMOUHostAddrKindBP FirstKind  = bHostLanOnly ? EMOUHostAddrKindBP::Punch  : EMOUHostAddrKindBP::Public;
+	const EMOUHostAddrKindBP SecondKind = bHostLanOnly ? EMOUHostAddrKindBP::Public : EMOUHostAddrKindBP::Punch;
+
+	for (const EMOUHostAddrKindBP Wanted : { FirstKind, SecondKind })
 	{
-		if (Candidates[Index].Kind == EMOUHostAddrKindBP::Public && Candidates[Index].IsValid())
+		for (int32 Index = 0; Index < Candidates.Num(); ++Index)
 		{
-			OutIndex = Index;
-			return Candidates[Index];
+			if (Candidates[Index].Kind == Wanted && Candidates[Index].IsValid())
+			{
+				UE_LOG(LogMOUServer, Log, TEXT("[여행] %s 로 간다. (방장 정적 개방=%s)"),
+					*Candidates[Index].ToDisplayString(),
+					bHostLanOnly ? TEXT("없음") : TEXT("있음"));
+				OutIndex = Index;
+				return Candidates[Index];
+			}
 		}
 	}
 
-	// 3순위: 남은 아무 것. 여기까지 오는 것은 서버가 예상 밖의 조합을 보낸 경우다.
+	// 마지막: 남은 아무 것. 여기까지 오는 것은 서버가 예상 밖의 조합을 보낸 경우다.
 	for (int32 Index = 0; Index < Candidates.Num(); ++Index)
 	{
 		if (Candidates[Index].IsValid())
@@ -1776,7 +1795,7 @@ bool UServerSubsystem::TravelToHost()
 	}
 
 	int32 ChosenIndex = INDEX_NONE;
-	const FMOUHostCandidate Chosen = ChooseHostCandidate(PendingHostReady.Candidates, ChosenIndex);
+	const FMOUHostCandidate Chosen = ChooseHostCandidate(PendingHostReady.Candidates, PendingHostReady.bLanOnly, ChosenIndex);
 	if (!Chosen.IsValid())
 	{
 		UE_LOG(LogMOUServer, Error, TEXT("[참여자] 쓸 수 있는 호스트 주소가 없다: %s"),

@@ -81,16 +81,27 @@ namespace
 	 *   지원하지 않으면 그 조합만 실패한다. 전원이 LAN 안에 있는 상황이라면
 	 *   애초에 --public-ip 를 주지 않는 편이 낫다.
 	 */
-	std::string ResolveHostAddress(const std::string& PeerAddress)
+	/**
+	 * 사설 주소를 서버의 공인 IP 로 치환한다. bVerbose 가 거짓이면 조용히 한다.
+	 *
+	 * ★ 로그를 끄는 스위치가 필요한 이유: 이 함수는 방을 만들 때(드물다)와
+	 *   엔드포인트를 관측할 때(자주, 한 등록당 여러 번) 둘 다 쓴다.
+	 *   방 생성용 문구를 후자에서도 찍으면 "호스트가 서버와 같은 네트워크에 있다" 가
+	 *   엉뚱한 맥락에서 도배되어 실제로 오해를 샀다.
+	 */
+	std::string ResolveHostAddress(const std::string& PeerAddress, bool bVerbose = true)
 	{
 		if (GPublicIp.empty() || !IsPrivateAddress(PeerAddress))
 		{
 			return PeerAddress;
 		}
 
-		std::printf("[방 주소] 호스트가 서버와 같은 네트워크에 있다(%s). "
-		            "외부 참가자를 위해 %s 로 바꿔 기록한다.\n",
-		            PeerAddress.c_str(), GPublicIp.c_str());
+		if (bVerbose)
+		{
+			std::printf("[방 주소] 호스트가 서버와 같은 네트워크에 있다(%s). "
+			            "외부 참가자를 위해 %s 로 바꿔 기록한다.\n",
+			            PeerAddress.c_str(), GPublicIp.c_str());
+		}
 		return GPublicIp;
 	}
 
@@ -155,7 +166,9 @@ namespace
 		//   보인다. 그 값을 그대로 punch 대상으로 넘기면 방장은 자기 LAN 의 엉뚱한
 		//   기기로 쏘게 되고, 구멍은 아무 데도 안 뚫린다.
 		//   실제로 Player1 의 엔드포인트가 192.168.35.1 로 관측되고 있었다.
-		const std::string SourceAddress = ResolveHostAddress(AddrText);
+		// 방 주소와 같은 규칙. 조용히 한다 — 등록은 자주 오고, 방 생성용 문구를
+		// 여기서 찍으면 엉뚱한 맥락에서 도배된다.
+		const std::string SourceAddress = ResolveHostAddress(AddrText, /*bVerbose=*/false);
 		const uint16_t    SourcePort    = ::ntohs(From.sin_port);
 
 		SessionPtr Target;
@@ -177,7 +190,7 @@ namespace
 
 		// ★ 위조 차단. 남의 UserId 를 적어 보내면 여기서 걸린다 —
 		//   그 사람의 TCP 연결은 다른 IP 에서 오고 있기 때문이다.
-		if (ResolveHostAddress(Target->PeerAddress) != SourceAddress)
+		if (ResolveHostAddress(Target->PeerAddress, /*bVerbose=*/false) != SourceAddress)
 		{
 			std::printf("[거부] 엔드포인트 등록의 출발지가 세션과 다르다: %s (세션은 %s)\n",
 			            SourceAddress.c_str(), Target->PeerAddress.c_str());

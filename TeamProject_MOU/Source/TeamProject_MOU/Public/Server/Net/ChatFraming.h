@@ -95,7 +95,7 @@ namespace MOUChat
 	// 호스트 주소 후보의 성격 (v8). 값이 어긋나면 LAN 후보를 공인으로 착각한다.
 	static_assert(static_cast<uint8>(EMOUHostAddrKindBP::Public) == static_cast<uint8>(MOU::EHostAddrKind::Public), "EMOUHostAddrKindBP::Public 이 서버 정의와 다르다");
 	static_assert(static_cast<uint8>(EMOUHostAddrKindBP::Lan)    == static_cast<uint8>(MOU::EHostAddrKind::Lan),    "EMOUHostAddrKindBP::Lan 이 서버 정의와 다르다");
-	static_assert(static_cast<uint8>(EMOUHostAddrKindBP::Relay)  == static_cast<uint8>(MOU::EHostAddrKind::Relay),  "EMOUHostAddrKindBP::Relay 가 서버 정의와 다르다");
+	static_assert(static_cast<uint8>(EMOUHostAddrKindBP::Punch)  == static_cast<uint8>(MOU::EHostAddrKind::Punch),  "EMOUHostAddrKindBP::Punch 가 서버 정의와 다르다");
 
 	/** TryExtractPacket 의 결과. 서버 MOU::EFrameResult 와 같은 의미다. */
 	enum class EFrameResult : uint8
