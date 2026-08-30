@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <thread>
@@ -202,6 +203,7 @@ namespace MOU
 		mutable std::mutex StateMutex;
 		FPeerState Host;
 		FPeerState Guest;
+		bool bReadyLogged = false;
 		FClock::time_point LastActivity = FClock::now();
 	};
 
@@ -625,6 +627,7 @@ namespace MOU
 					{
 						const auto& Datagram = *reinterpret_cast<const FUdpRelayRegistrationDatagram*>(Buffer.data());
 						bool bAccepted = false;
+						bool bBecameReady = false;
 						{
 							std::lock_guard<std::mutex> StateLock(Entry.Route->StateMutex);
 							const bool bValid = Datagram.Version == kRelayRegistrationVersion &&
@@ -651,6 +654,12 @@ namespace MOU
 									PeerState.LastRegistration = Now;
 									Entry.Route->LastActivity = Now;
 									bAccepted = true;
+									if (Entry.Route->Host.bRegistered && Entry.Route->Guest.bRegistered &&
+										!Entry.Route->bReadyLogged)
+									{
+										Entry.Route->bReadyLogged = true;
+										bBecameReady = true;
+									}
 								}
 							}
 						}
@@ -658,6 +667,18 @@ namespace MOU
 						if (bAccepted)
 						{
 							AcceptedRegistrations_.fetch_add(1, std::memory_order_relaxed);
+							char Address[INET_ADDRSTRLEN] = {};
+							(void)::inet_ntop(AF_INET, &From.sin_addr, Address, sizeof(Address));
+							std::printf("[릴레이] route=%llu %s 등록: %s:%u\n",
+								static_cast<unsigned long long>(Entry.Route->Id),
+								Entry.Peer == EUdpRelayPeer::Host ? "host" : "guest",
+								Address[0] != '\0' ? Address : "<unknown>",
+								static_cast<unsigned>(::ntohs(From.sin_port)));
+							if (bBecameReady)
+							{
+								std::printf("[릴레이] route=%llu 양쪽 등록 완료. UE UDP 전달을 시작한다.\n",
+									static_cast<unsigned long long>(Entry.Route->Id));
+							}
 						}
 						else
 						{

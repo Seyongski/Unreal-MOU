@@ -721,6 +721,12 @@ private:
 	 */
 	void PollGuestHostReadyTimeout(float DeltaTime);
 
+	/** 직접/relay 접속이 엔진의 긴 타임아웃에 갇히지 않도록 별도 시간 제한을 적용한다. */
+	void PollTravelConnection(float DeltaTime);
+
+	/** PendingNetGame 또는 현재 World의 서버 연결이 실제로 열린 상태인가. */
+	bool IsTravelConnectionOpen() const;
+
 	/** 방장이 리슨서버를 연다. HostMapName 이 비어 있으면 아무것도 하지 않는다. */
 	void TravelAsHost();
 
@@ -843,8 +849,11 @@ private:
 	 */
 	FMOURoomJoinResult PendingHostReady;
 
-	/** PendingHostReady.Candidates 중 마지막으로 시도한 인덱스. 폴백이 여기서 이어간다. */
+	/** PendingHostReady.Candidates 중 마지막으로 시도한 인덱스. 폴백 탐색 시작점이다. */
 	int32 TriedCandidateIndex = INDEX_NONE;
+
+	/** 이미 시도한 후보. 전부 실패한 뒤 첫 후보로 영원히 순환하는 것을 막는다. */
+	TSet<int32> TriedCandidateIndices;
 
 	/**
 	 * 참여자가 RoomStart 를 받고 나서 흐른 시간. 출발 신호를 기다리는 중에만 센다.
@@ -978,6 +987,7 @@ private:
 
 	EMOUTravelTransport ActiveTravelTransport = EMOUTravelTransport::None;
 	bool bRelayFallbackTried = false;
+	float TravelAttemptSeconds = 0.f;
 
 	/** 내가 방장인 방 번호. RoomCreateAck 로 확정되고, 방을 닫거나 끊기면 0 이 된다. */
 	int32 MyRoomId = 0;

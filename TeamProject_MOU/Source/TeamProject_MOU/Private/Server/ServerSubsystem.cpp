@@ -22,7 +22,9 @@
 #include "Server/ServerSettings.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
+#include "Engine/NetConnection.h"
 #include "Engine/NetDriver.h"
+#include "Engine/PendingNetGame.h"
 #include "SocketSubsystem.h"
 #include "Sockets.h"                          // FSocket (프로브·등록·홀펀칭이 직접 쓴다)
 #include "Server/Net/MOUIpNetDriver.h"        // 클라이언트 바인드 포트 고정 (v10)
@@ -39,6 +41,11 @@ DEFINE_LOG_CATEGORY(LogMOUServer);
 
 namespace
 {
+	// 에디터/비최적화 빌드는 UE의 InitialConnectTimeout 배율이 매우 커질 수 있다.
+	// MOU의 직접 우선 -> relay 정책은 짧고 명확한 자체 제한으로 전환한다.
+	constexpr float kDirectAttemptTimeoutSeconds = 8.f;
+	constexpr float kRelayAttemptTimeoutSeconds  = 15.f;
+
 	/**
 	 * 로그 표시용 채널 이름.
 	 * 서버 Server.cpp 의 ChannelName() 과 같은 문자열을 쓴다.
@@ -671,10 +678,12 @@ void UServerSubsystem::ClearRoomState()
 	//   지난 방의 주소로 떠난다.
 	PendingHostReady = FMOURoomJoinResult();
 	TriedCandidateIndex = INDEX_NONE;
+	TriedCandidateIndices.Reset();
 	PendingHostRelayRoutes.Reset();
 	PendingGuestRelayRoute = FMOUGameRelayRoute();
 	ActiveTravelTransport = EMOUTravelTransport::None;
 	bRelayFallbackTried = false;
+	TravelAttemptSeconds = 0.f;
 	UMOUIpNetDriver::ClearPendingRelayRegistrations();
 	TravelRoomPassword.Reset();
 }
@@ -712,6 +721,7 @@ bool UServerSubsystem::Tick(float DeltaTime)
 	PollListenServer(DeltaTime);
 	PollGuestHostReadyTimeout(DeltaTime);
 	PollReachabilityProbe(DeltaTime);
+	PollTravelConnection(DeltaTime);
 
 	// 1) 상태 변화 처리
 	FServerClientEvent Event;
@@ -896,6 +906,7 @@ bool UServerSubsystem::Tick(float DeltaTime)
 				GuestWaitSeconds          = 0.f;
 				PendingHostReady          = FMOURoomJoinResult();   // 지난 판의 값이 남아 있으면 안 된다
 				TriedCandidateIndex       = INDEX_NONE;
+				TriedCandidateIndices.Reset();
 			}
 
 			// ★ UI 보다 먼저 브로드캐스트하지 않는다. 위젯이 안내 문구를 띄우고
@@ -926,6 +937,7 @@ bool UServerSubsystem::Tick(float DeltaTime)
 			//   예전에는 정보가 통째로 사라져서 참여자가 영영 못 떠났다.
 			PendingHostReady          = Event.Join;
 			TriedCandidateIndex       = INDEX_NONE;
+			TriedCandidateIndices.Reset();
 			PendingGuestRelayRoute    = Event.GuestRelayRoute;
 			bRelayFallbackTried       = false;
 			ActiveTravelTransport     = EMOUTravelTransport::None;
@@ -1918,6 +1930,8 @@ bool UServerSubsystem::TravelToHost()
 
 	// 실패하면 다음 후보로 넘어갈 수 있게 어디까지 써봤는지 남긴다.
 	TriedCandidateIndex = ChosenIndex;
+	TriedCandidateIndices.Reset();
+	TriedCandidateIndices.Add(ChosenIndex);
 	ActiveTravelTransport = EMOUTravelTransport::Direct;
 	bRelayFallbackTried = false;
 
@@ -1953,8 +1967,16 @@ bool UServerSubsystem::TryNextHostCandidate()
 	{
 		const int32 Index = (TriedCandidateIndex + Offset + CandidateCount) % CandidateCount;
 		const FMOUHostCandidate& Next = PendingHostReady.Candidates[Index];
-		if (!Next.IsValid())
+		if (!Next.IsValid() || TriedCandidateIndices.Contains(Index))
 		{
+			continue;
+		}
+
+		// 처음 선택되지 않은 LAN 후보는 이 PC의 어댑터와 같은 /24가 아니다.
+		// 다른 집의 192.168.x.x를 시도하며 시간을 버리거나 엉뚱한 장비에 보내지 않는다.
+		if (Next.Kind == EMOUHostAddrKindBP::Lan)
+		{
+			TriedCandidateIndices.Add(Index);
 			continue;
 		}
 
@@ -1966,6 +1988,7 @@ bool UServerSubsystem::TryNextHostCandidate()
 		}
 
 		TriedCandidateIndex = Index;
+		TriedCandidateIndices.Add(Index);
 
 		// ★ 이 폴백이 없으면 후보 선택이 한 번 빗나갈 때마다 접속이 통째로 실패한다.
 		//   /24 판정은 넷마스크를 모르고 하는 추측이라 빗나갈 수 있다. 빗나가도
@@ -2091,8 +2114,95 @@ void UServerSubsystem::ReleasePreloadedMap()
 void UServerSubsystem::NotifyTravelingTo(const FString& HostAddress, int32 HostPort)
 {
 	PendingTravelAddress = FString::Printf(TEXT("%s:%d"), *HostAddress, HostPort);
+	TravelAttemptSeconds = 0.f;
 
 	UE_LOG(LogMOUServer, Log, TEXT("[참여자] %s 로 접속을 시도한다."), *PendingTravelAddress);
+}
+
+bool UServerSubsystem::IsTravelConnectionOpen() const
+{
+	const UGameInstance* GI = GetGameInstance();
+	UWorld* World = GI ? GI->GetWorld() : nullptr;
+	if (World == nullptr)
+	{
+		return false;
+	}
+
+	auto IsDriverOpen = [](const UNetDriver* Driver)
+	{
+		return Driver != nullptr && Driver->ServerConnection != nullptr &&
+			Driver->ServerConnection->GetConnectionState() == USOCK_Open;
+	};
+
+	if (IsDriverOpen(World->GetNetDriver()))
+	{
+		return true;
+	}
+
+	// ClientTravel 중에는 NetDriver가 아직 현재 World에 붙지 않고
+	// PendingNetGame에 있다. 이것도 확인해야 느린 맵 로딩을 실패로 오판하지 않는다.
+	if (GEngine != nullptr)
+	{
+		if (const FWorldContext* Context = GEngine->GetWorldContextFromWorld(World))
+		{
+			return Context->PendingNetGame != nullptr &&
+				IsDriverOpen(Context->PendingNetGame->NetDriver);
+		}
+	}
+	return false;
+}
+
+void UServerSubsystem::PollTravelConnection(float DeltaTime)
+{
+	if (ActiveTravelTransport == EMOUTravelTransport::None)
+	{
+		TravelAttemptSeconds = 0.f;
+		return;
+	}
+
+	if (IsTravelConnectionOpen())
+	{
+		UE_LOG(LogMOUServer, Log, TEXT("[접속 성공] %s 경로로 서버 연결이 열렸다."),
+			ActiveTravelTransport == EMOUTravelTransport::Relay ? TEXT("릴레이") : TEXT("직접"));
+		PendingTravelAddress.Reset();
+		ActiveTravelTransport = EMOUTravelTransport::None;
+		TravelAttemptSeconds = 0.f;
+		return;
+	}
+
+	TravelAttemptSeconds += FMath::Max(0.f, DeltaTime);
+	const float Timeout = ActiveTravelTransport == EMOUTravelTransport::Relay
+		? kRelayAttemptTimeoutSeconds : kDirectAttemptTimeoutSeconds;
+	if (TravelAttemptSeconds < Timeout)
+	{
+		return;
+	}
+
+	if (ActiveTravelTransport == EMOUTravelTransport::Direct)
+	{
+		UE_LOG(LogMOUServer, Warning,
+			TEXT("[직접 연결] %.0f초 동안 handshake 응답이 없어 다음 경로로 전환한다: %s"),
+			Timeout, *PendingTravelAddress);
+		if (TryNextHostCandidate() || TryRelayFallback())
+		{
+			return;
+		}
+	}
+	else
+	{
+		UE_LOG(LogMOUServer, Error,
+			TEXT("[릴레이 실패] %.0f초 동안 handshake 응답이 없다: %s"),
+			Timeout, *PendingTravelAddress);
+	}
+
+	const FString Reason = ActiveTravelTransport == EMOUTravelTransport::Relay
+		? TEXT("직접 연결과 자체 UDP 릴레이 모두 응답하지 않았습니다. relay 포트포워딩과 방화벽을 확인하세요.")
+		: TEXT("방장의 직접 연결 후보와 자체 UDP 릴레이를 모두 사용할 수 없습니다.");
+	PendingTravelAddress.Reset();
+	ActiveTravelTransport = EMOUTravelTransport::None;
+	TravelAttemptSeconds = 0.f;
+	UMOUIpNetDriver::ClearPendingRelayRegistrations();
+	OnTravelFailed.Broadcast(Reason);
 }
 
 void UServerSubsystem::HandleNetworkFailure(UWorld* /*World*/, UNetDriver* /*NetDriver*/,
@@ -2150,6 +2260,7 @@ void UServerSubsystem::HandleNetworkFailure(UWorld* /*World*/, UNetDriver* /*Net
 		Reason += TEXT("\n직접 연결과 자체 UDP 릴레이 모두 연결되지 않았습니다. 서버 relay UDP 포트 범위의 포워딩과 방화벽을 확인하세요.");
 	}
 	ActiveTravelTransport = EMOUTravelTransport::None;
+	TravelAttemptSeconds = 0.f;
 
 	OnTravelFailed.Broadcast(Reason);
 }
@@ -2170,6 +2281,7 @@ void UServerSubsystem::HandleTravelFailure(UWorld* /*World*/,
 	OnTravelFailed.Broadcast(Reason);
 	PendingTravelAddress.Reset();
 	ActiveTravelTransport = EMOUTravelTransport::None;
+	TravelAttemptSeconds = 0.f;
 	UMOUIpNetDriver::ClearPendingRelayRegistrations();
 }
 void UServerSubsystem::LogListenServerReachability() const
