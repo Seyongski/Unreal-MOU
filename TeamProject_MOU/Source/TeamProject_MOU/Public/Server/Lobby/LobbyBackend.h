@@ -158,6 +158,12 @@ struct FServerClientEvent
 	/** Type == RoomStart 일 때만 유효. 방장이 punch 할 대상들 (v10) */
 	TArray<FMOUHostCandidate> PunchTargets;
 
+	/** Type == RoomStart 일 때만 유효. 방장 전용 relay host-facing 경로들 (v11). */
+	TArray<FMOUGameRelayRoute> HostRelayRoutes;
+
+	/** Type == RoomHostReady 일 때만 유효. 이 참여자 전용 relay guest-facing 경로 (v11). */
+	FMOUGameRelayRoute GuestRelayRoute;
+
 	/**
 	 * Type == RoomMemberList 일 때만 유효.
 	 * 백엔드가 판정한 값이다. 클라이언트가 Members 를 보고 직접 세지 않는다 —

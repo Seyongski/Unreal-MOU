@@ -12,6 +12,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "ChatProtocol.h"
 #include "LobbyTypes.generated.h"
 
 /**
@@ -212,6 +213,39 @@ struct FMOUHostCandidate
 			(Kind == EMOUHostAddrKindBP::Lan)   ? TEXT("LAN")   :
 			(Kind == EMOUHostAddrKindBP::Punch) ? TEXT("홀펀칭") : TEXT("공인");
 		return FString::Printf(TEXT("%s:%d(%s)"), *Address, Port, KindText);
+	}
+};
+
+/**
+ * 직접 연결이 끝내 실패했을 때만 쓰는 참여자 전용 UDP 릴레이 경로. (v11)
+ *
+ * 이 타입은 네이티브 전송 상태용이다. Token 은 블루프린트나 로그로 내보내지 않고,
+ * UE 넷드라이버가 실제 게임 소켓에서 relay 등록 데이터그램을 만들 때만 사용한다.
+ */
+struct FMOUGameRelayRoute
+{
+	FString Address;
+	int32   Port = 0;
+	uint64  RouteId = 0;
+	TArray<uint8> Token;
+
+	bool HasValidToken() const { return Token.Num() == static_cast<int32>(MOU::kRelayTokenBytes); }
+	bool IsValid() const { return !Address.IsEmpty() && Port > 0 && RouteId != 0 && HasValidToken(); }
+
+	/** 참여자가 relay 의 guest-facing 포트로 떠날 때 쓴다. Token 은 URL 에 절대 넣지 않는다. */
+	FString MakeGuestTravelURL(const FString& RoomPassword) const
+	{
+		FString URL = FString::Printf(TEXT("%s:%d"), *Address, Port);
+		if (!RoomPassword.IsEmpty())
+		{
+			URL += FString::Printf(TEXT("?RoomPassword=%s"), *RoomPassword);
+		}
+		return URL;
+	}
+
+	FString ToGuestDisplayString() const
+	{
+		return FString::Printf(TEXT("%s:%d(릴레이)"), *Address, Port);
 	}
 };
 

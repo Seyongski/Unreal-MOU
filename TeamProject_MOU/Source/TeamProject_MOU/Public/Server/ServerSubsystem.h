@@ -105,6 +105,14 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FOnDirectMessageReceived, const FMOU
 /** 대화 기록 도착. 오래된 것 -> 최신 순. bHasMore 면 위로 더 있다. */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FOnDmHistoryReceived, int64, PeerUserId, const TArray<FMOUDirectMessage>&, Messages, bool, bHasMore);
 
+/** 지금 진행 중인 ClientTravel 이 직접 후보인지 relay 폴백인지 구분한다. */
+enum class EMOUTravelTransport : uint8
+{
+	None,
+	Direct,
+	Relay,
+};
+
 /**
  * 서버 연결의 소유자.
  *
@@ -919,6 +927,12 @@ private:
 	 */
 	void PunchTowardPeers();
 
+	/** 기존 GameSocket으로 relay capability를 미리 등록해 NAT 매핑을 예열한다. */
+	void RegisterRelayRouteFromGameSocket(const FMOUGameRelayRoute& Route, bool bHost);
+
+	/** 실제 UE client socket 등록을 예약하고 guest-facing relay 포트로 떠난다. */
+	bool TryRelayFallback();
+
 	/** 프로브를 끝내고 결과를 알린다. 소켓을 닫는 유일한 경로다. */
 	void FinishReachabilityProbe(bool bReachable, const FString& Detail);
 
@@ -955,6 +969,15 @@ private:
 
 	/** 방을 떠났을 때 대기실 관련 상태를 한 번에 비운다. */
 	void ClearRoomState();
+
+	/** RoomStart 에서 받은 방장 전용 host-facing relay 경로들. */
+	TArray<FMOUGameRelayRoute> PendingHostRelayRoutes;
+
+	/** RoomHostReady 에서 받은 이 참여자 전용 guest-facing relay 경로. */
+	FMOUGameRelayRoute PendingGuestRelayRoute;
+
+	EMOUTravelTransport ActiveTravelTransport = EMOUTravelTransport::None;
+	bool bRelayFallbackTried = false;
 
 	/** 내가 방장인 방 번호. RoomCreateAck 로 확정되고, 방을 닫거나 끊기면 0 이 된다. */
 	int32 MyRoomId = 0;

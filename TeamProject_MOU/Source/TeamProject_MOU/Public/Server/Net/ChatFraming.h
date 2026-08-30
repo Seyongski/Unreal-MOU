@@ -174,6 +174,10 @@ namespace MOUChat
 	void ReadHostCandidates(const MOU::HostCandidate* Src, int32 Count,
 		TArray<FMOUHostCandidate>& OutCandidates);
 
+	/** v11 relay wire 경로를 네이티브 전송 상태로 옮긴다. Token 은 UI에 노출하지 않는다. */
+	FMOUGameRelayRoute ReadRelayHostRoute(const MOU::RelayHostRoute& Src);
+	FMOUGameRelayRoute ReadRelayGuestRoute(const MOU::RelayGuestRoute& Src);
+
 	/** 길이가 명시된 UTF-8 바이트열(ChatBroadcast 뒤에 붙는 본문)을 FString 으로 변환한다. */
 	FString Utf8ToString(const uint8* Src, int32 Len);
 }

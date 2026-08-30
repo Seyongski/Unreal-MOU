@@ -429,7 +429,12 @@ void UServerSubsystem::CreateRoom(const FString& Title, const FString& RoomPassw
 	// 전송 방식의 문제가 아니다. 백엔드가 바뀌어도 같은 규칙이어야 한다.
 	const FString EffectivePassword = IsValidRoomPassword(RoomPassword) ? RoomPassword : FString();
 
-	Backend->CreateRoom(Title, EffectivePassword, HostPort, GetLocalLanAddress());
+	// 방에 광고하는 포트와 나중에 실제 listen socket 이 bind 할 포트를 하나로 맞춘다.
+	// 7777 이 이미 사용 중이면 EnsureGameSocket 이 7778 등으로 옮길 수 있는데, 예전에는
+	// 방 목록만 7777을 계속 가리켜 relay bootstrap과 직접 후보가 서로 어긋날 수 있었다.
+	RegisterGameEndpoint(HostPort);
+	const int32 AdvertisedPort = ReservedGamePort > 0 ? ReservedGamePort : HostPort;
+	Backend->CreateRoom(Title, EffectivePassword, AdvertisedPort, GetLocalLanAddress());
 }
 
 void UServerSubsystem::RequestRoomList()
@@ -666,6 +671,11 @@ void UServerSubsystem::ClearRoomState()
 	//   지난 방의 주소로 떠난다.
 	PendingHostReady = FMOURoomJoinResult();
 	TriedCandidateIndex = INDEX_NONE;
+	PendingHostRelayRoutes.Reset();
+	PendingGuestRelayRoute = FMOUGameRelayRoute();
+	ActiveTravelTransport = EMOUTravelTransport::None;
+	bRelayFallbackTried = false;
+	UMOUIpNetDriver::ClearPendingRelayRegistrations();
 	TravelRoomPassword.Reset();
 }
 
@@ -870,6 +880,14 @@ bool UServerSubsystem::Tick(float DeltaTime)
 				PunchTargets = Event.PunchTargets;
 				UE_CLOG(PunchTargets.Num() > 0, LogMOUServer, Log,
 					TEXT("[홀펀칭] 참여자 %d명의 주소를 받았다."), PunchTargets.Num());
+
+				// 각 참여자에 대한 host-facing relay capability. UI에는 내보내지 않고
+				// TravelAsHost -> 실제 listen socket bootstrap 에서만 쓴다.
+				PendingHostRelayRoutes = Event.HostRelayRoutes;
+				for (const FMOUGameRelayRoute& Route : PendingHostRelayRoutes)
+				{
+					RegisterRelayRouteFromGameSocket(Route, /*bHost=*/true);
+				}
 			}
 			else
 			{
@@ -908,8 +926,12 @@ bool UServerSubsystem::Tick(float DeltaTime)
 			//   예전에는 정보가 통째로 사라져서 참여자가 영영 못 떠났다.
 			PendingHostReady          = Event.Join;
 			TriedCandidateIndex       = INDEX_NONE;
+			PendingGuestRelayRoute    = Event.GuestRelayRoute;
+			bRelayFallbackTried       = false;
+			ActiveTravelTransport     = EMOUTravelTransport::None;
 			bGuestWaitingForHostReady = false;
 			GuestWaitSeconds          = 0.f;
+			RegisterRelayRouteFromGameSocket(PendingGuestRelayRoute, /*bHost=*/false);
 
 			OnRoomHostReady.Broadcast(Event.Join);
 
@@ -1598,6 +1620,48 @@ void UServerSubsystem::PunchTowardPeers()
 	}
 }
 
+void UServerSubsystem::RegisterRelayRouteFromGameSocket(const FMOUGameRelayRoute& Route, bool bHost)
+{
+	if (!Route.IsValid())
+	{
+		return;  // relay가 꺼졌거나 이 방에 배정된 경로가 없다.
+	}
+	if (GameSocket == nullptr)
+	{
+		UE_LOG(LogMOUServer, Verbose,
+			TEXT("[릴레이] 게임 소켓이 아직 없어 예열 등록은 건너뛴다. 실제 넷드라이버 소켓에서 다시 등록한다."));
+		return;
+	}
+
+	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
+	if (Sockets == nullptr)
+	{
+		return;
+	}
+
+	TSharedRef<FInternetAddr> Destination = Sockets->CreateInternetAddr();
+	bool bValidAddress = false;
+	Destination->SetIp(*Route.Address, bValidAddress);
+	Destination->SetPort(Route.Port);
+	if (!bValidAddress)
+	{
+		UE_LOG(LogMOUServer, Warning, TEXT("[릴레이] 주소 '%s' 를 IP로 해석하지 못했다."), *Route.Address);
+		return;
+	}
+
+	const MOU::RelayRegistrationDatagram Datagram = MOU::MakeRelayRegistrationDatagram(
+		Route.RouteId, bHost ? MOU::ERelayPeerRole::Host : MOU::ERelayPeerRole::Guest,
+		Route.Token.GetData());
+	int32 Sent = 0;
+	for (int32 Attempt = 0; Attempt < 3; ++Attempt)
+	{
+		GameSocket->SendTo(reinterpret_cast<const uint8*>(&Datagram), sizeof(Datagram), Sent, *Destination);
+	}
+
+	UE_LOG(LogMOUServer, Log, TEXT("[릴레이] 게임 포트 %d 에서 %s 경로를 예열 등록했다: %s"),
+		ReservedGamePort, bHost ? TEXT("host") : TEXT("guest"), *Route.ToGuestDisplayString());
+}
+
 FString UServerSubsystem::GetLocalLanAddress()
 {
 	ISocketSubsystem* Sockets = ISocketSubsystem::Get(PLATFORM_SOCKETSUBSYSTEM);
@@ -1753,6 +1817,25 @@ void UServerSubsystem::TravelAsHost()
 		FinishReachabilityProbe(false, TEXT("게임이 먼저 시작되어 확인을 마치지 못했습니다."));
 	}
 
+	// 실제 listen socket 이 bind 된 직후 host capability 를 다시 보내게 예약한다.
+	// GameSocket 예열 뒤 close/rebind 사이에 NAT 매핑이 바뀌어도 이 등록이 진짜다.
+	TArray<FMOUPendingRelayRegistration> HostRegistrations;
+	for (const FMOUGameRelayRoute& Route : PendingHostRelayRoutes)
+	{
+		if (!Route.IsValid())
+		{
+			continue;
+		}
+		FMOUPendingRelayRegistration Registration;
+		Registration.Address = Route.Address;
+		Registration.Port    = Route.Port;
+		Registration.RouteId = Route.RouteId;
+		Registration.Token   = Route.Token;
+		HostRegistrations.Add(MoveTemp(Registration));
+	}
+	UMOUIpNetDriver::SetPendingHostRelayRegistrations(HostRegistrations);
+	UMOUIpNetDriver::SetDesiredListenPort(ReservedGamePort);
+
 	// ★ 순서가 중요하다: punch 를 **먼저**, 소켓 닫기를 그 다음.
 	//
 	//   punch 는 게임 포트에 bind 된 이 소켓에서 나가야 NAT 구멍이 그 포트에 뚫린다.
@@ -1819,6 +1902,12 @@ bool UServerSubsystem::TravelToHost()
 
 	if (PendingHostReady.bLanOnly && Chosen.Kind != EMOUHostAddrKindBP::Lan && !bMayHavePunchedHole)
 	{
+		if (TryRelayFallback())
+		{
+			UE_LOG(LogMOUServer, Log, TEXT("[참여자] 방장이 LAN 전용으로 판정되어 직접 후보 대신 relay로 이동한다."));
+			return true;
+		}
+
 		const FString Reason = TEXT(
 			"이 방은 같은 공유기 안에서만 참여할 수 있습니다.\n"
 			"방장 쪽 공유기가 외부 접속을 넘겨주지 않습니다.");
@@ -1829,6 +1918,8 @@ bool UServerSubsystem::TravelToHost()
 
 	// 실패하면 다음 후보로 넘어갈 수 있게 어디까지 써봤는지 남긴다.
 	TriedCandidateIndex = ChosenIndex;
+	ActiveTravelTransport = EMOUTravelTransport::Direct;
+	bRelayFallbackTried = false;
 
 	UE_LOG(LogMOUServer, Log, TEXT("[참여자] 후보 %d개 중 %s 선택 (전체: %s)"),
 		PendingHostReady.Candidates.Num(), *Chosen.ToDisplayString(),
@@ -1855,9 +1946,12 @@ bool UServerSubsystem::TryNextHostCandidate()
 		return false;
 	}
 
-	// 이미 써본 것 다음부터, 유효한 후보를 하나 찾는다.
-	for (int32 Index = TriedCandidateIndex + 1; Index < PendingHostReady.Candidates.Num(); ++Index)
+	// ChooseHostCandidate 가 LAN 항목을 골랐을 때 그보다 앞의 공인 항목도 반드시
+	// 한 번은 시도해야 한다. 끝에만 가는 옛 루프는 그 항목을 영영 건너뛰었다.
+	const int32 CandidateCount = PendingHostReady.Candidates.Num();
+	for (int32 Offset = 1; Offset < CandidateCount; ++Offset)
 	{
+		const int32 Index = (TriedCandidateIndex + Offset + CandidateCount) % CandidateCount;
 		const FMOUHostCandidate& Next = PendingHostReady.Candidates[Index];
 		if (!Next.IsValid())
 		{
@@ -1885,6 +1979,38 @@ bool UServerSubsystem::TryNextHostCandidate()
 	}
 
 	return false;
+}
+
+bool UServerSubsystem::TryRelayFallback()
+{
+	if (bRelayFallbackTried || !PendingGuestRelayRoute.IsValid())
+	{
+		return false;
+	}
+
+	UGameInstance* GI = GetGameInstance();
+	APlayerController* PC = GI ? GI->GetFirstLocalPlayerController() : nullptr;
+	if (PC == nullptr)
+	{
+		return false;
+	}
+
+	FMOUPendingRelayRegistration Registration;
+	Registration.Address = PendingGuestRelayRoute.Address;
+	Registration.Port    = PendingGuestRelayRoute.Port;
+	Registration.RouteId = PendingGuestRelayRoute.RouteId;
+	Registration.Token   = PendingGuestRelayRoute.Token;
+	UMOUIpNetDriver::SetPendingClientRelayRegistration(Registration);
+
+	bRelayFallbackTried = true;
+	ActiveTravelTransport = EMOUTravelTransport::Relay;
+	NotifyTravelingTo(PendingGuestRelayRoute.Address, PendingGuestRelayRoute.Port);
+
+	UE_LOG(LogMOUServer, Log, TEXT("[릴레이] 직접 후보가 실패해 %s 로 폴백한다."),
+		*PendingGuestRelayRoute.ToGuestDisplayString());
+	PC->ClientTravel(PendingGuestRelayRoute.MakeGuestTravelURL(TravelRoomPassword),
+		ETravelType::TRAVEL_Absolute);
+	return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -2008,13 +2134,22 @@ void UServerSubsystem::HandleNetworkFailure(UWorld* /*World*/, UNetDriver* /*Net
 
 	PendingTravelAddress.Reset();
 
-	// ★ 사용자에게 실패를 알리기 전에 남은 후보를 먼저 써본다. (v8)
-	//   LAN 후보를 골랐는데 그 판단이 빗나갔다면, 공인 후보로 가면 될 일이다.
-	//   여기서 바로 포기하면 후보 목록을 만든 의미가 없다.
-	if (TryNextHostCandidate())
+	// ★ relay 자체의 실패를 다시 direct 후보로 되돌리면 무한 루프가 된다.
+	// 직접 경로가 실패했을 때만 남은 직접 후보를 돌고, 그 뒤 relay를 정확히 한 번 쓴다.
+	if (ActiveTravelTransport == EMOUTravelTransport::Direct && TryNextHostCandidate())
 	{
 		return;
 	}
+	if (ActiveTravelTransport == EMOUTravelTransport::Direct && TryRelayFallback())
+	{
+		return;
+	}
+
+	if (ActiveTravelTransport == EMOUTravelTransport::Relay)
+	{
+		Reason += TEXT("\n직접 연결과 자체 UDP 릴레이 모두 연결되지 않았습니다. 서버 relay UDP 포트 범위의 포워딩과 방화벽을 확인하세요.");
+	}
+	ActiveTravelTransport = EMOUTravelTransport::None;
 
 	OnTravelFailed.Broadcast(Reason);
 }
@@ -2034,6 +2169,8 @@ void UServerSubsystem::HandleTravelFailure(UWorld* /*World*/,
 
 	OnTravelFailed.Broadcast(Reason);
 	PendingTravelAddress.Reset();
+	ActiveTravelTransport = EMOUTravelTransport::None;
+	UMOUIpNetDriver::ClearPendingRelayRegistrations();
 }
 void UServerSubsystem::LogListenServerReachability() const
 {

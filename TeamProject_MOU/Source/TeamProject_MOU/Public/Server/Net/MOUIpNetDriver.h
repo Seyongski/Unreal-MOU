@@ -1,4 +1,4 @@
-// MOU 넷드라이버 - 클라이언트 바인드 포트를 고정하기 위한 최소 상속. (v10)
+// MOU 넷드라이버 - 클라이언트 바인드 포트와 relay 실제 소켓 등록을 위한 최소 상속. (v11)
 //
 // [왜 필요한가]
 //   UDP 홀펀칭은 "방장이 참여자의 **정확한 공인 IP:포트** 로 먼저 한 발 쏜다" 로
@@ -25,7 +25,24 @@
 
 #include "CoreMinimal.h"
 #include "IpNetDriver.h"
+#include "ChatProtocol.h"
+#include <atomic>
 #include "MOUIpNetDriver.generated.h"
+
+/** 실제 UE 소켓이 bind 된 직후 relay 등록에 쓸 비공개 capability 묶음. */
+struct FMOUPendingRelayRegistration
+{
+	FString Address;
+	int32   Port = 0;
+	uint64  RouteId = 0;
+	TArray<uint8> Token;
+
+	bool IsPresent() const
+	{
+		return !Address.IsEmpty() && Port > 0 && RouteId != 0 &&
+			Token.Num() == static_cast<int32>(MOU::kRelayTokenBytes);
+	}
+};
 
 UCLASS(Transient, Config = Engine)
 class TEAMPROJECT_MOU_API UMOUIpNetDriver : public UIpNetDriver
@@ -43,8 +60,24 @@ public:
 	static void SetDesiredClientPort(int32 Port);
 	static int32 GetDesiredClientPort();
 
+	/** 방장이 실제 listen socket 을 bind 할 포트. 0이면 엔진의 기본 선택을 쓴다. */
+	static void SetDesiredListenPort(int32 Port);
+
+	/** InitListen 성공 뒤 실제 listen socket 에서 보낼 host-facing relay 등록들. */
+	static void SetPendingHostRelayRegistrations(const TArray<FMOUPendingRelayRegistration>& Registrations);
+
+	/** InitBase(클라이언트) 성공 뒤 실제 client socket 에서 보낼 guest-facing relay 등록. */
+	static void SetPendingClientRelayRegistration(const FMOUPendingRelayRegistration& Registration);
+
+	/** 방을 나가거나 연결을 끊을 때 아직 소비되지 않은 capability 를 지운다. */
+	static void ClearPendingRelayRegistrations();
+
 	//~ UIpNetDriver
 	virtual int GetClientPort() override;
+	virtual bool InitBase(bool bInitAsClient, FNetworkNotify* InNotify, const FURL& URL,
+		bool bReuseAddressAndPort, FString& Error) override;
+	virtual bool InitListen(FNetworkNotify* InNotify, FURL& ListenURL,
+		bool bReuseAddressAndPort, FString& Error) override;
 	//~ End UIpNetDriver
 
 private:
@@ -53,4 +86,8 @@ private:
 	 * 설정 시점이 멀어서 atomic 으로 두어 의도를 분명히 한다.
 	 */
 	static std::atomic<int32> DesiredClientPort;
+	static std::atomic<int32> DesiredListenPort;
+	static FCriticalSection RelayRegistrationMutex;
+	static TArray<FMOUPendingRelayRegistration> PendingHostRelayRegistrations;
+	static FMOUPendingRelayRegistration PendingClientRelayRegistration;
 };

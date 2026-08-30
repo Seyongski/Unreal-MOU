@@ -46,7 +46,10 @@ namespace MOU
 	//            다른 포트 답장은 10발 중 0발). 방장은 참여자의 엔드포인트를 알 수
 	//            없으므로 서버가 UDP 로 관측해 RoomStart 에 실어 내려준다.
 	//            이것으로 릴레이 없이 "누구나 호스트" 가 된다.
-	constexpr uint16_t kProtocolVersion = 10;
+	//  10 -> 11: 직접 연결이 끝내 성립하지 않는 NAT 를 위한 자체 UDP 릴레이 폴백을
+	//            추가했다. 릴레이는 UE 게임 패킷을 해석하지 않고 그대로 전달하며,
+	//            방장/참여자는 실제 게임 소켓에서 일회성 capability 로만 등록한다.
+	constexpr uint16_t kProtocolVersion = 11;
 
 	// BodySize 가 이 값을 넘으면 악성 패킷으로 보고 연결을 끊는다.
 	constexpr uint32_t kMaxBodySize = 4096;
@@ -91,6 +94,9 @@ namespace MOU
 	constexpr uint32_t kMaxRoomTitleLen  = 48;
 	constexpr uint32_t kRoomPasswordLen  = 4;    // 숫자 4자리. 널 종료를 두지 않는다
 	constexpr uint32_t kMaxPlayersInRoom = 4;    // 1~4인 게임
+	// 방장은 자기 자신을 제외한 각 참여자마다 relay UDP 포트 쌍 하나가 필요하다.
+	constexpr uint32_t kMaxRelayRoutes = kMaxPlayersInRoom - 1;
+	constexpr uint32_t kRelayTokenBytes = 32;
 	constexpr uint32_t kMaxRoomsInList   = 20;   // 한 번에 내려주는 방 개수 상한
 	constexpr uint32_t kMaxAddressLen    = 16;   // "255.255.255.255" + 널
 
@@ -645,6 +651,82 @@ namespace MOU
 		uint8_t  Reserved[2];
 	};
 
+	/**
+	 * 한 참여자 전용의 투명 UDP 릴레이 경로. (v11)
+	 *
+	 * HostPort / GuestPort 는 서로 다른 포트다. 한 포트만 공유하면 UE 리슨서버가
+	 * 모든 참여자를 같은 relay IP:port 에서 온 하나의 연결로 보게 된다.
+	 * HostToken / GuestToken 은 서로 다른 capability 이며, TCP 로 전달된 뒤 실제
+	 * 게임 UDP 소켓에서 relay 등록에만 쓴다.
+	 * 절대로 UE 게임 데이터 앞에 붙이지 않는다.
+	 */
+	struct RelayHostRoute
+	{
+		char     Address[kMaxAddressLen];
+		uint16_t HostPort;
+		uint64_t RouteId;
+		uint8_t  HostToken[kRelayTokenBytes];
+	};
+
+	/** 참여자에게만 내려가는 guest-facing relay 경로. HostToken 을 절대 담지 않는다. */
+	struct RelayGuestRoute
+	{
+		char     Address[kMaxAddressLen];
+		uint16_t GuestPort;
+		uint64_t RouteId;
+		uint8_t  GuestToken[kRelayTokenBytes];
+	};
+
+	/** relay 등록 데이터그램의 Peer 필드 값. */
+	enum class ERelayPeerRole : uint8_t
+	{
+		Host  = 1,
+		Guest = 2,
+	};
+
+	/**
+	 * relay 전용 UDP 제어 패킷. byte 단위로 정의해 플랫폼 패딩/엔디언에 의존하지 않는다.
+	 * Magic 은 ASCII "MOUR", RouteId 는 big-endian 이며 Token 은 32 raw bytes 다.
+	 */
+	struct RelayRegistrationDatagram
+	{
+		uint8_t Magic[4];
+		uint8_t Version;
+		uint8_t Peer;
+		uint8_t Reserved[2];
+		uint8_t RouteId[8];
+		uint8_t Token[kRelayTokenBytes];
+	};
+
+	constexpr uint8_t kRelayRegistrationMagic[4] = { 'M', 'O', 'U', 'R' };
+	constexpr uint8_t kRelayRegistrationVersion = 1;
+
+	/** RelayRegistrationDatagram 을 만들 때 RouteId 를 네트워크 바이트 순서로 넣는다. */
+	inline RelayRegistrationDatagram MakeRelayRegistrationDatagram(
+		uint64_t RouteId, ERelayPeerRole Peer, const uint8_t* Token)
+	{
+		RelayRegistrationDatagram Out{};
+		for (uint32_t Index = 0; Index < 4; ++Index)
+		{
+			Out.Magic[Index] = kRelayRegistrationMagic[Index];
+		}
+		Out.Version = kRelayRegistrationVersion;
+		Out.Peer    = static_cast<uint8_t>(Peer);
+		for (int32_t Index = 7; Index >= 0; --Index)
+		{
+			Out.RouteId[Index] = static_cast<uint8_t>(RouteId & 0xffu);
+			RouteId >>= 8;
+		}
+		if (Token != nullptr)
+		{
+			for (uint32_t Index = 0; Index < kRelayTokenBytes; ++Index)
+			{
+				Out.Token[Index] = Token[Index];
+			}
+		}
+		return Out;
+	}
+
 	struct RoomStartBody
 	{
 		uint32_t      RoomId;
@@ -661,6 +743,12 @@ namespace MOU
 		PeerEndpoint  PunchTargets[kMaxPlayersInRoom];
 		uint8_t       PunchTargetCount;
 		uint8_t       Reserved2[3];
+
+		// ★ 방장에게만 내려준다. 각 참여자와 연결될 host-facing relay 포트다.
+		// 참여자에게는 0으로 비워서 다른 사람의 capability 를 주지 않는다.
+		RelayHostRoute RelayRoutes[kMaxRelayRoutes];
+		uint8_t       RelayRouteCount;
+		uint8_t       Reserved3[3];
 	};
 
 	/**
@@ -684,6 +772,10 @@ namespace MOU
 		uint8_t       CandidateCount;
 		uint8_t       bLanOnly;                        // 1 이면 같은 LAN 에서만 들어올 수 있다 (v9)
 		uint8_t       Reserved[2];
+
+		// 이 패킷은 참여자별로 만든다. GuestPort 로 ClientTravel 하면 된다.
+		// Address 가 비었거나 Port 가 0 이면 이 방에는 relay 폴백이 없다.
+		RelayGuestRoute Relay;
 	};
 
 	// ------------------------------------------------------------------
@@ -869,10 +961,13 @@ namespace MOU
 	static_assert(sizeof(RoomReadyReqBody)   ==  1, "RoomReadyReqBody 에 패딩이 끼었다");
 	static_assert(sizeof(RoomClosedBody)     ==  5, "RoomClosedBody 에 패딩이 끼었다");
 	static_assert(sizeof(PeerEndpoint)           == 20, "PeerEndpoint 에 패딩이 끼었다");
-	static_assert(sizeof(RoomStartBody)      == 152, "RoomStartBody 에 패딩이 끼었다");
+	static_assert(sizeof(RelayHostRoute)         == 58, "RelayHostRoute 에 패딩이 끼었다");
+	static_assert(sizeof(RelayGuestRoute)        == 58, "RelayGuestRoute 에 패딩이 끼었다");
+	static_assert(sizeof(RelayRegistrationDatagram) == 48, "RelayRegistrationDatagram 에 패딩이 끼었다");
+	static_assert(sizeof(RoomStartBody)      == 330, "RoomStartBody 에 패딩이 끼었다");
 	static_assert(sizeof(ClientEndpointDatagram) == 16, "ClientEndpointDatagram 에 패딩이 끼었다");
 	static_assert(sizeof(ClientEndpointAckBody)  == 24, "ClientEndpointAckBody 에 패딩이 끼었다");
-	static_assert(sizeof(RoomHostReadyBody)  == 68, "RoomHostReadyBody 에 패딩이 끼었다");
+	static_assert(sizeof(RoomHostReadyBody)  == 126, "RoomHostReadyBody 에 패딩이 끼었다");
 	static_assert(sizeof(HostProbeDatagram)     == 8, "HostProbeDatagram 에 패딩이 끼었다");
 	static_assert(sizeof(HostProbeReqBody)      == 8, "HostProbeReqBody 에 패딩이 끼었다");
 	static_assert(sizeof(HostProbeSentBody)     == 8, "HostProbeSentBody 에 패딩이 끼었다");

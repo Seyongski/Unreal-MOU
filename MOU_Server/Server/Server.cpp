@@ -12,6 +12,7 @@
 #include "NatPortMapping.h"
 #include "Rooms.h"
 #include "Session.h"
+#include "UdpRelay.h"
 #include "Framing.h"
 
 #include <algorithm>
@@ -21,8 +22,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <memory>
+#include <mutex>
+#include <random>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace MOU;
@@ -35,6 +40,23 @@ namespace
 	// 이 서버가 외부에 노출된 주소. --public-ip 인자나 UPnP 결과로 채워진다.
 	// 비어 있으면 치환을 하지 않는다(예전과 똑같이 동작한다).
 	std::string GPublicIp;
+
+	/** --relay 로 켰을 때만 만드는, 게임 패킷 비해석 UDP 릴레이. */
+	std::unique_ptr<UdpRelay> GRelay;
+	std::string GRelayPublicIp;
+	std::string GRelayLanIp;
+	std::atomic<uint64_t> GNextRelayRouteId{ 1 };
+
+	/** 한 참여자에게 줄 host/guest capability 는 반드시 분리한다. */
+	struct FRelayRouteAssignment
+	{
+		uint64_t        GuestUserId = 0;
+		RelayHostRoute  Host;
+		RelayGuestRoute Guest;
+	};
+
+	std::mutex GRelayRoutesMutex;
+	std::unordered_map<uint32_t, std::vector<FRelayRouteAssignment>> GRelayRoutesByRoom;
 
 	/**
 	 * 사설/루프백 대역인가.
@@ -103,6 +125,179 @@ namespace
 			            PeerAddress.c_str(), GPublicIp.c_str());
 		}
 		return GPublicIp;
+	}
+
+	/** std::random_device 는 Windows/Linux 에서 OS 난수원을 사용한다. token 은 로그에 남기지 않는다. */
+	bool MakeRelayToken(FUdpRelayToken& OutToken)
+	{
+		try
+		{
+			std::random_device Random;
+			bool bAnyNonZero = false;
+			for (std::uint8_t& Byte : OutToken)
+			{
+				Byte = static_cast<std::uint8_t>(Random());
+				bAnyNonZero = bAnyNonZero || Byte != 0;
+			}
+			return bAnyNonZero;
+		}
+		catch (...)
+		{
+			return false;
+		}
+	}
+
+	/** RoomStart 의 방장 전용 경로 목록을 복사한다. */
+	std::vector<RelayHostRoute> GetHostRelayRoutes(uint32_t RoomId)
+	{
+		std::vector<RelayHostRoute> Result;
+		std::lock_guard<std::mutex> Lock(GRelayRoutesMutex);
+		const auto It = GRelayRoutesByRoom.find(RoomId);
+		if (It == GRelayRoutesByRoom.end())
+		{
+			return Result;
+		}
+
+		Result.reserve(It->second.size());
+		for (const FRelayRouteAssignment& Assignment : It->second)
+		{
+			Result.push_back(Assignment.Host);
+		}
+		return Result;
+	}
+
+	/** RoomHostReady 를 개인화할 때 해당 참여자의 guest-facing 경로 하나를 얻는다. */
+	bool GetGuestRelayRoute(uint32_t RoomId, uint64_t GuestUserId, RelayGuestRoute& OutRoute)
+	{
+		OutRoute = {};
+		std::lock_guard<std::mutex> Lock(GRelayRoutesMutex);
+		const auto It = GRelayRoutesByRoom.find(RoomId);
+		if (It == GRelayRoutesByRoom.end())
+		{
+			return false;
+		}
+
+		for (const FRelayRouteAssignment& Assignment : It->second)
+		{
+			if (Assignment.GuestUserId == GuestUserId)
+			{
+				OutRoute = Assignment.Guest;
+				return true;
+			}
+		}
+		return false;
+	}
+
+	void SetRelayAddress(RelayHostRoute& Route, const std::string& Address)
+	{
+		CopyFixedString(Route.Address, kMaxAddressLen, Address);
+	}
+
+	void SetRelayAddress(RelayGuestRoute& Route, const std::string& Address)
+	{
+		CopyFixedString(Route.Address, kMaxAddressLen, Address);
+	}
+
+	void ReleaseRelayRoutesForRoom(uint32_t RoomId)
+	{
+		if (RoomId == 0)
+		{
+			return;
+		}
+		{
+			std::lock_guard<std::mutex> Lock(GRelayRoutesMutex);
+			GRelayRoutesByRoom.erase(RoomId);
+		}
+		if (GRelay)
+		{
+			GRelay->RemoveRoutesForRoom(RoomId);
+		}
+	}
+
+	void ReleaseRelayRouteForGuest(uint32_t RoomId, uint64_t GuestUserId)
+	{
+		uint64_t RouteId = 0;
+		{
+			std::lock_guard<std::mutex> Lock(GRelayRoutesMutex);
+			const auto It = GRelayRoutesByRoom.find(RoomId);
+			if (It == GRelayRoutesByRoom.end())
+			{
+				return;
+			}
+			for (auto RouteIt = It->second.begin(); RouteIt != It->second.end(); ++RouteIt)
+			{
+				if (RouteIt->GuestUserId == GuestUserId)
+				{
+					RouteId = RouteIt->Host.RouteId;
+					It->second.erase(RouteIt);
+					break;
+				}
+			}
+			if (It->second.empty())
+			{
+				GRelayRoutesByRoom.erase(It);
+			}
+		}
+		if (RouteId != 0 && GRelay)
+		{
+			GRelay->RemoveRoute(RouteId);
+		}
+	}
+
+	/** 게임 시작 시 모든 참여자별 relay 포트 쌍과 서로 다른 capability 를 만든다. */
+	bool AllocateRelayRoutes(uint32_t RoomId, uint64_t HostUserId,
+	                         const std::vector<uint64_t>& Recipients)
+	{
+		if (!GRelay || !GRelay->IsRunning() || GRelayPublicIp.empty())
+		{
+			return false;
+		}
+
+		std::vector<FRelayRouteAssignment> Created;
+		Created.reserve(Recipients.size());
+		for (const uint64_t UserId : Recipients)
+		{
+			if (UserId == HostUserId)
+			{
+				continue;
+			}
+
+			FUdpRelayToken HostToken{};
+			FUdpRelayToken GuestToken{};
+			FUdpRelayPortPair Ports{};
+			const uint64_t RouteId = GNextRelayRouteId.fetch_add(1);
+			if (RouteId == 0 || !MakeRelayToken(HostToken) || !MakeRelayToken(GuestToken) ||
+				HostToken == GuestToken || !GRelay->CreateRoute(RouteId, HostToken, GuestToken, RoomId, Ports))
+			{
+				for (const FRelayRouteAssignment& Assignment : Created)
+				{
+					GRelay->RemoveRoute(Assignment.Host.RouteId);
+				}
+				return false;
+			}
+
+			FRelayRouteAssignment Assignment{};
+			Assignment.GuestUserId = UserId;
+			CopyFixedString(Assignment.Host.Address, kMaxAddressLen, GRelayPublicIp);
+			Assignment.Host.HostPort = Ports.HostPort;
+			Assignment.Host.RouteId = RouteId;
+			std::copy(HostToken.begin(), HostToken.end(), Assignment.Host.HostToken);
+
+			CopyFixedString(Assignment.Guest.Address, kMaxAddressLen, GRelayPublicIp);
+			Assignment.Guest.GuestPort = Ports.GuestPort;
+			Assignment.Guest.RouteId = RouteId;
+			std::copy(GuestToken.begin(), GuestToken.end(), Assignment.Guest.GuestToken);
+			Created.push_back(Assignment);
+		}
+
+		if (Created.empty())
+		{
+			return true;  // 혼자 시작한 방은 relay 경로가 필요 없다.
+		}
+
+		std::lock_guard<std::mutex> Lock(GRelayRoutesMutex);
+		GRelayRoutesByRoom[RoomId] = std::move(Created);
+		return true;
 	}
 
 	/**
@@ -958,6 +1153,17 @@ namespace
 			return;   // 어느 방에도 없었다
 		}
 
+		// relay route 는 방 멤버십과 같은 수명이다. 방장이 나가면 모두, 참여자가
+		// 나가면 그 사람의 포트 쌍만 즉시 닫아 늦은 UDP가 다음 방에 섞이지 않게 한다.
+		if (bRoomClosed)
+		{
+			ReleaseRelayRoutesForRoom(RoomId);
+		}
+		else
+		{
+			ReleaseRelayRouteForGuest(RoomId, Session->UserId);
+		}
+
 		if (bRoomClosed)
 		{
 			std::printf("[방 삭제] #%u 방장 %s(%llu) 가 나갔다. 남은 %zu명에게 통보. 남은 방 %zu개\n",
@@ -1269,7 +1475,52 @@ namespace
 			}
 		}
 
-		SendToUsers(Recipients, EOpcode::RoomStart, &Start, sizeof(Start), nullptr, 0);
+
+		// 직접 후보는 전원에게 같지만, relay capability 는 절대로 브로드캐스트하지
+		// 않는다. 방장만 host-facing 경로 전부를 받고, 참여자 RoomStart 는 0으로 둔다.
+		const bool bRelayAllocated = AllocateRelayRoutes(RoomId, Session->UserId, Recipients);
+		if (bRelayAllocated)
+		{
+			std::vector<RelayHostRoute> HostRoutes = GetHostRelayRoutes(RoomId);
+			if (!GRelayLanIp.empty() && IsPrivateAddress(Session->PeerAddress))
+			{
+				for (RelayHostRoute& Route : HostRoutes)
+				{
+					SetRelayAddress(Route, GRelayLanIp);
+				}
+			}
+			Start.RelayRouteCount = static_cast<uint8_t>(std::min<std::size_t>(HostRoutes.size(), kMaxRelayRoutes));
+			for (uint8_t Index = 0; Index < Start.RelayRouteCount; ++Index)
+			{
+				Start.RelayRoutes[Index] = HostRoutes[Index];
+			}
+			if (Start.RelayRouteCount > 0)
+			{
+				std::printf("[릴레이] #%u 방장에 %u개 host-facing 경로를 전달했다.\n",
+				            RoomId, static_cast<unsigned>(Start.RelayRouteCount));
+			}
+		}
+		else if (GRelay && GRelay->IsRunning())
+		{
+			std::printf("[릴레이] #%u 경로 할당 실패. 이번 방은 직접 연결만 시도한다.\n", RoomId);
+		}
+
+		// 방장에게만 capability 가 채워진 body 를 보낸다.
+		SendPacket(Session->Sock, EOpcode::RoomStart, &Start, sizeof(Start));
+
+		// 나머지 멤버에게는 relay 필드가 모두 0인 같은 RoomStart 를 보낸다.
+		std::vector<uint64_t> GuestRecipients;
+		GuestRecipients.reserve(Recipients.size());
+		for (const uint64_t UserId : Recipients)
+		{
+			if (UserId != Session->UserId)
+			{
+				GuestRecipients.push_back(UserId);
+			}
+		}
+		Start.RelayRouteCount = 0;
+		std::memset(Start.RelayRoutes, 0, sizeof(Start.RelayRoutes));
+		SendToUsers(GuestRecipients, EOpcode::RoomStart, &Start, sizeof(Start), nullptr, 0);
 
 		// ★ 방이 InGame 이 됐으므로 이 방 사람들의 친구에게 "게임중" 을 알린다 (M4).
 		//   Recipients 는 방 멤버 전원이다 - 방장도 포함된다.
@@ -1385,12 +1636,24 @@ namespace
 		std::printf("[호스트 준비] #%u 리슨서버가 열렸다. 참여자 %zu명에게 출발 신호 (주소 후보 %zu개)\n",
 		            RoomId, Recipients.size(), Candidates.size());
 
-		RoomHostReadyBody Ready{};
-		Ready.RoomId         = RoomId;
-		Ready.CandidateCount = FillCandidates(Ready.Candidates, Candidates);
-		Ready.bLanOnly       = bLanOnly ? 1 : 0;
-
-		SendToUsers(Recipients, EOpcode::RoomHostReady, &Ready, sizeof(Ready), nullptr, 0);
+		// GuestPort/token 은 참여자마다 다르므로, RoomHostReady 는 더 이상 하나를
+		// 브로드캐스트할 수 없다. direct 후보는 같고 Relay 만 개인화한다.
+		for (const uint64_t GuestUserId : Recipients)
+		{
+			RoomHostReadyBody Ready{};
+			Ready.RoomId         = RoomId;
+			Ready.CandidateCount = FillCandidates(Ready.Candidates, Candidates);
+			Ready.bLanOnly       = bLanOnly ? 1 : 0;
+			if (const SessionPtr Guest = FindAuthedSession(GuestUserId))
+			{
+				GetGuestRelayRoute(RoomId, GuestUserId, Ready.Relay);
+				if (!GRelayLanIp.empty() && IsPrivateAddress(Guest->PeerAddress))
+				{
+					SetRelayAddress(Ready.Relay, GRelayLanIp);
+				}
+				SendPacket(Guest->Sock, EOpcode::RoomHostReady, &Ready, sizeof(Ready));
+			}
+		}
 		return true;
 	}
 
@@ -2023,9 +2286,12 @@ int main(int argc, char** argv)
 	// MSVC 는 _IOLBF(줄 버퍼링)를 _IOFBF 와 동일하게 처리하므로 무버퍼로 둔다.
 	::setvbuf(stdout, nullptr, _IONBF, 0);
 
-	// 인자 파싱. --upnp / --public-ip 는 어디에 와도 되고,
+	// 인자 파싱. --upnp / --public-ip / --relay 는 어디에 와도 되고,
 	// 나머지는 순서대로 <port> [db경로] 다.
 	bool        bUseUpnp = false;
+	bool        bUseRelay = false;
+	uint16_t    RelayFirstPort = 10000;
+	uint16_t    RelayLastPort  = 10127;
 	const char* PortArg  = nullptr;
 	const char* DbArg    = nullptr;
 
@@ -2034,6 +2300,69 @@ int main(int argc, char** argv)
 		if (std::strcmp(argv[Index], "--upnp") == 0)
 		{
 			bUseUpnp = true;
+		}
+		else if (std::strcmp(argv[Index], "--relay") == 0)
+		{
+			bUseRelay = true;
+		}
+		else if (std::strncmp(argv[Index], "--relay-public-ip=", 18) == 0)
+		{
+			GRelayPublicIp = argv[Index] + 18;
+			bUseRelay = true;
+		}
+		else if (std::strcmp(argv[Index], "--relay-public-ip") == 0)
+		{
+			if (Index + 1 >= argc)
+			{
+				std::printf("[오류] --relay-public-ip 뒤에 주소가 없다.\n");
+				return 1;
+			}
+			GRelayPublicIp = argv[++Index];
+			bUseRelay = true;
+		}
+		else if (std::strncmp(argv[Index], "--relay-lan-ip=", 15) == 0)
+		{
+			GRelayLanIp = argv[Index] + 15;
+			bUseRelay = true;
+		}
+		else if (std::strcmp(argv[Index], "--relay-lan-ip") == 0)
+		{
+			if (Index + 1 >= argc)
+			{
+				std::printf("[오류] --relay-lan-ip 뒤에 주소가 없다.\n");
+				return 1;
+			}
+			GRelayLanIp = argv[++Index];
+			bUseRelay = true;
+		}
+		else if (std::strncmp(argv[Index], "--relay-ports=", 14) == 0 ||
+		         std::strcmp(argv[Index], "--relay-ports") == 0)
+		{
+			const char* Range = nullptr;
+			if (std::strncmp(argv[Index], "--relay-ports=", 14) == 0)
+			{
+				Range = argv[Index] + 14;
+			}
+			else if (Index + 1 < argc)
+			{
+				Range = argv[++Index];
+			}
+			if (Range == nullptr)
+			{
+				std::printf("[오류] --relay-ports 뒤에 10000-10127 형태의 범위가 필요하다.\n");
+				return 1;
+			}
+			unsigned First = 0, Last = 0;
+			char Trailing = '\0';
+			if (std::sscanf(Range, "%u-%u%c", &First, &Last, &Trailing) != 2 || First == 0 || Last > 65535 ||
+				First > Last || ((Last - First + 1) % 2) != 0)
+			{
+				std::printf("[오류] relay UDP 포트 범위 '%s' 가 잘못됐다. 짝수 개의 1-65535 범위를 써야 한다.\n", Range);
+				return 1;
+			}
+			RelayFirstPort = static_cast<uint16_t>(First);
+			RelayLastPort  = static_cast<uint16_t>(Last);
+			bUseRelay = true;
 		}
 		// --public-ip=1.2.3.4 와 --public-ip 1.2.3.4 를 둘 다 받는다.
 		// 붙여 쓰는 쪽만 지원하면 공백을 넣었을 때 그 값이 db경로로 먹혀
@@ -2074,10 +2403,21 @@ int main(int argc, char** argv)
 		            GPublicIp.c_str());
 		return 1;
 	}
+	if (!GRelayPublicIp.empty() && IsPrivateAddress(GRelayPublicIp))
+	{
+		std::printf("[오류] --relay-public-ip 에 사설 주소(%s)를 줬다. 공인 IP 를 줘야 한다.\n",
+		            GRelayPublicIp.c_str());
+		return 1;
+	}
+	if (!GRelayLanIp.empty() && !IsPrivateAddress(GRelayLanIp))
+	{
+		std::printf("[오류] --relay-lan-ip 는 서버 PC의 사설 LAN IPv4여야 한다: %s\n", GRelayLanIp.c_str());
+		return 1;
+	}
 
 	if (PortArg == nullptr)
 	{
-		std::printf("사용법: %s <port> [db경로] [--upnp] [--public-ip <주소>]\n", argv[0]);
+		std::printf("사용법: %s <port> [db경로] [--upnp] [--public-ip <주소>] [--relay]\n", argv[0]);
 		std::printf("  db경로를 생략하면 현재 디렉터리의 chat_log.db 를 쓴다.\n");
 		std::printf("  --upnp : 공유기(UPnP)에 이 포트를 자동으로 열어달라고 요청한다.\n");
 		std::printf("           다른 네트워크에서 접속시킬 때만 필요하다. 같은 공유기\n");
@@ -2085,6 +2425,12 @@ int main(int argc, char** argv)
 		std::printf("  --public-ip : 이 서버의 공인 IP. 방장이 서버와 같은 공유기 안에\n");
 		std::printf("           있을 때, 방의 호스트 주소로 사설 IP 대신 이 값을 기록한다.\n");
 		std::printf("           안 주면 --upnp 성공 시 알아낸 값을 자동으로 쓴다.\n");
+		std::printf("  --relay : 직접 UDP 연결 실패 시 사용할 자체 UDP relay 를 켠다.\n");
+		std::printf("           기본 범위는 10000-10127/UDP 이며, 공유기에 같은 범위를\n");
+		std::printf("           이 PC로 수동 포트포워딩해야 한다. --public-ip 를 재사용한다.\n");
+		std::printf("  --relay-public-ip <주소> : relay 전용 공인 IP 를 명시한다.\n");
+		std::printf("  --relay-lan-ip <주소> : 서버와 같은 LAN 참가자에게 줄 사설 relay 주소.\n");
+		std::printf("  --relay-ports <처음-끝> : 예: --relay-ports 10000-10127\n");
 		return 1;
 	}
 
@@ -2229,6 +2575,47 @@ int main(int argc, char** argv)
 		}
 	}
 
+	// relay 는 공인 주소와 **별도 UDP 포트 범위**가 있어야 한다. 기존 9000/UDP 는
+	// 엔드포인트 등록용 단일 소켓이라 여러 UE 참여자를 투명하게 중계할 수 없다.
+	if (bUseRelay)
+	{
+		if (GRelayPublicIp.empty())
+		{
+			GRelayPublicIp = GPublicIp;  // 보통은 로그인 서버와 같은 공인 IP 다.
+		}
+
+		if (GRelayPublicIp.empty() || IsPrivateAddress(GRelayPublicIp))
+		{
+			std::printf("[릴레이] 비활성: --relay-public-ip 또는 --public-ip 로 공인 주소를 줘야 한다.\n");
+		}
+		else
+		{
+			FUdpRelayConfig Config;
+			Config.FirstPort = RelayFirstPort;
+			Config.LastPort  = RelayLastPort;
+			GRelay = std::make_unique<UdpRelay>();
+			if (!GRelay->Start(Config))
+			{
+				std::printf("[릴레이] UDP %u-%u 를 열지 못했다. 직접 연결만 계속한다.\n",
+				            static_cast<unsigned>(RelayFirstPort), static_cast<unsigned>(RelayLastPort));
+				GRelay.reset();
+			}
+			else
+			{
+				std::printf("[릴레이] 활성: %s:%u-%u/UDP (참여자당 포트 2개)\n",
+				            GRelayPublicIp.c_str(), static_cast<unsigned>(RelayFirstPort),
+				            static_cast<unsigned>(RelayLastPort));
+				std::printf("[릴레이] ★ 공유기에 외부 UDP %u-%u -> 이 PC 를 수동 포트포워딩해야 한다.\n",
+				            static_cast<unsigned>(RelayFirstPort), static_cast<unsigned>(RelayLastPort));
+				if (!GRelayLanIp.empty())
+				{
+					std::printf("[릴레이] 서버와 같은 LAN 참가자에게는 %s 를 내려준다(헤어핀 회피).\n",
+					            GRelayLanIp.c_str());
+				}
+			}
+		}
+	}
+
 	// 방장이 서버와 같은 공유기 안에 있을 때 무엇으로 바꿔 기록할지.
 	// 이게 비어 있으면 예전 동작 그대로이고, 그 조합에서만 외부 참가자가
 	// 사설 주소를 받아 무한 로딩에 걸린다. 켤 때 분명히 보이게 찍어둔다.
@@ -2293,6 +2680,15 @@ int main(int argc, char** argv)
 	{
 		CloseSocket(GProbeSock);
 		GProbeSock = kInvalidSocket;
+	}
+	if (GRelay)
+	{
+		GRelay->Stop();
+		GRelay.reset();
+	}
+	{
+		std::lock_guard<std::mutex> Lock(GRelayRoutesMutex);
+		GRelayRoutesByRoom.clear();
 	}
 
 	ChatLog::Stop();

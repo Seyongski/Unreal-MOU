@@ -518,6 +518,18 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 				}
 			}
 		}
+
+		// relay host-facing 경로는 방장에게만 내려온다. 다른 참여자는 Count=0 이다.
+		Event.HostRelayRoutes.Reset();
+		const int32 RelayCount = FMath::Min<int32>(Start.RelayRouteCount, MOU::kMaxRelayRoutes);
+		for (int32 i = 0; i < RelayCount; ++i)
+		{
+			FMOUGameRelayRoute Route = MOUChat::ReadRelayHostRoute(Start.RelayRoutes[i]);
+			if (Route.IsValid())
+			{
+				Event.HostRelayRoutes.Add(MoveTemp(Route));
+			}
+		}
 		Event.Join.bLanOnly    = (Start.bLanOnly != 0);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
@@ -542,6 +554,7 @@ void FServerClientRunnable::HandlePacket(const MOU::PacketHeader& Header, const 
 		Event.Join.RoomId      = static_cast<int32>(Ready.RoomId);
 		MOUChat::ReadHostCandidates(Ready.Candidates, Ready.CandidateCount, Event.Join.Candidates);
 		Event.Join.bLanOnly    = (Ready.bLanOnly != 0);
+		Event.GuestRelayRoute  = MOUChat::ReadRelayGuestRoute(Ready.Relay);
 		InboundEvents.Enqueue(MoveTemp(Event));
 		break;
 	}

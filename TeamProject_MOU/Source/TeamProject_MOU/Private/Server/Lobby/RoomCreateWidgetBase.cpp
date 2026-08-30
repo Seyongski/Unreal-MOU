@@ -110,7 +110,10 @@ void URoomCreateWidgetBase::NativeConstruct()
 			if (Nat->GetMappedExternalPort() == 0 && !Nat->IsMappingInProgress())
 			{
 				Nat->BeginPortMapping(HostPort);
-				bWillRunUpnp = true;
+				// 설정에서 UPnP를 꺼 둔 경우 BeginPortMapping은 즉시 돌아온다.
+				// 그때도 true로 두면 수동 포트포워딩 사용자가 도달성 프로브를 영영
+				// 시작하지 못하므로, 실제로 워커가 시작됐는지만 다시 읽는다.
+				bWillRunUpnp = Nat->IsMappingInProgress();
 			}
 			else if (Nat->IsMappingInProgress())
 			{

@@ -198,3 +198,23 @@ void MOUChat::ReadHostCandidates(const MOU::HostCandidate* Src, int32 Count,
 		}
 	}
 }
+
+FMOUGameRelayRoute MOUChat::ReadRelayHostRoute(const MOU::RelayHostRoute& Src)
+{
+	FMOUGameRelayRoute Out;
+	Out.Address = ReadFixedString(Src.Address, static_cast<int32>(MOU::kMaxAddressLen));
+	Out.Port    = static_cast<int32>(Src.HostPort);
+	Out.RouteId = Src.RouteId;
+	Out.Token.Append(Src.HostToken, static_cast<int32>(MOU::kRelayTokenBytes));
+	return Out;
+}
+
+FMOUGameRelayRoute MOUChat::ReadRelayGuestRoute(const MOU::RelayGuestRoute& Src)
+{
+	FMOUGameRelayRoute Out;
+	Out.Address = ReadFixedString(Src.Address, static_cast<int32>(MOU::kMaxAddressLen));
+	Out.Port    = static_cast<int32>(Src.GuestPort);
+	Out.RouteId = Src.RouteId;
+	Out.Token.Append(Src.GuestToken, static_cast<int32>(MOU::kRelayTokenBytes));
+	return Out;
+}
