@@ -66,6 +66,7 @@ void URoomCreateWidgetBase::NativeConstruct()
 		if (UServerSubsystem* Chat = GetServerSubsystem())
 		{
 			Chat->OnRoomCreated.AddDynamic(this, &URoomCreateWidgetBase::HandleRoomCreated);
+			Chat->OnReachabilityChecked.AddDynamic(this, &URoomCreateWidgetBase::HandleReachabilityChecked);
 			bSubscribed = true;
 		}
 	}
@@ -148,6 +149,7 @@ void URoomCreateWidgetBase::NativeDestruct()
 		if (UServerSubsystem* Chat = GetServerSubsystem())
 		{
 			Chat->OnRoomCreated.RemoveDynamic(this, &URoomCreateWidgetBase::HandleRoomCreated);
+			Chat->OnReachabilityChecked.RemoveDynamic(this, &URoomCreateWidgetBase::HandleReachabilityChecked);
 		}
 		bSubscribed = false;
 	}
@@ -342,6 +344,16 @@ void URoomCreateWidgetBase::TryCreateRoom()
 		}
 	}
 
+	// 포트 매핑이 끝났더라도 실제 외부 패킷 확인이 진행 중이면 그 결과까지 기다린다.
+	// ReportReachability가 CreateRoom보다 먼저 같은 TCP 큐에 들어가야 서버가 방 생성
+	// 로그부터 정확한 외부 접속 상태를 표시할 수 있다.
+	if (Chat->IsProbingReachability())
+	{
+		bCreateWaitingForProbe = true;
+		SetMessage(TEXT("외부 접속 가능 여부를 확인하는 중입니다..."), false);
+		return;
+	}
+
 	SubmitCreateRoom();
 }
 
@@ -404,6 +416,15 @@ void URoomCreateWidgetBase::HandleNatMappingFinished(EMOUNatResultBP Result, int
 	if (bCreateWaitingForNat)
 	{
 		bCreateWaitingForNat = false;
+		if (UServerSubsystem* Server = GetServerSubsystem())
+		{
+			if (Server->IsProbingReachability())
+			{
+				bCreateWaitingForProbe = true;
+				SetMessage(TEXT("포트 매핑 완료. 실제 외부 접속을 확인하는 중입니다..."), false);
+				return;
+			}
+		}
 		SubmitCreateRoom();
 		return;
 	}
@@ -425,6 +446,21 @@ void URoomCreateWidgetBase::HandleNatMappingFinished(EMOUNatResultBP Result, int
 	}
 }
 
+void URoomCreateWidgetBase::HandleReachabilityChecked(bool bReachable, const FString& Detail)
+{
+	if (!bCreateWaitingForProbe)
+	{
+		return;
+	}
+
+	bCreateWaitingForProbe = false;
+	SetMessage(bReachable
+		? TEXT("외부 접속 확인 완료. 방을 만듭니다...")
+		: FString::Printf(TEXT("직접 연결 확인 실패(%s). 릴레이 폴백을 포함해 방을 만듭니다..."), *Detail),
+		false);
+	SubmitCreateRoom();
+}
+
 void URoomCreateWidgetBase::CancelCreate()
 {
 	// ★ 호스트가 되기를 그만뒀으므로 열어둔 포트를 닫는다.
@@ -435,6 +471,7 @@ void URoomCreateWidgetBase::CancelCreate()
 	}
 
 	bCreateWaitingForNat = false;
+	bCreateWaitingForProbe = false;
 
 	OnRoomCreateCancelled.ExecuteIfBound();
 	RemoveFromParent();

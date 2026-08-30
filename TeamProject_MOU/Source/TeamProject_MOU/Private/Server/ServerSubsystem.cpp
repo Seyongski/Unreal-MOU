@@ -966,8 +966,14 @@ bool UServerSubsystem::Tick(float DeltaTime)
 			{
 				if (Event.bProbeSent)
 				{
-					bProbeDispatched = true;
-					ProbeWaitSeconds = 0.f;
+					// 재시도 요청의 HostProbeSent가 올 때마다 시간을 0으로 만들면
+					// 실패 상한이 영원히 밀린다. 첫 발사 확인에서만 시작한다.
+					if (!bProbeDispatched)
+					{
+						bProbeDispatched = true;
+						ProbeWaitSeconds = 0.f;
+						ProbeRetrySeconds = 0.f;
+					}
 				}
 				else
 				{
@@ -1413,6 +1419,8 @@ void UServerSubsystem::BeginReachabilityProbe(int32 Port)
 	ProbeNonce        = FMath::Max(1u, static_cast<uint32>(FMath::Rand()) ^ static_cast<uint32>(FPlatformTime::Cycles()));
 	ProbeWaitSeconds  = 0.f;
 	ProbeTotalSeconds = 0.f;
+	ProbeRetrySeconds = 0.f;
+	ProbeRequestAttempts = 1;
 	bProbeDispatched  = false;
 	bProbing          = true;
 
@@ -1430,6 +1438,18 @@ void UServerSubsystem::PollReachabilityProbe(float DeltaTime)
 	}
 
 	ProbeTotalSeconds += DeltaTime;
+	ProbeRetrySeconds += DeltaTime;
+
+	// AddPortMapping 성공 응답과 실제 NAT 규칙 적용 사이에 지연이 있는 공유기가 있다.
+	// UDP 한 발만으로 판정하면 PIE를 다시 켠 직후 결과가 흔들리므로 같은 nonce로
+	// 1초 간격 최대 5회 요청한다. 서버 응답은 작고 TCP 제어 패킷도 매우 작다.
+	if (ProbeRetrySeconds >= 1.f && ProbeRequestAttempts < 5 && Backend.IsValid())
+	{
+		ProbeRetrySeconds = 0.f;
+		++ProbeRequestAttempts;
+		Backend->RequestHostProbe(ReservedGamePort, ProbeNonce);
+		UE_LOG(LogMOUServer, Verbose, TEXT("[프로브] 외부 UDP 발사 재요청 %d/5"), ProbeRequestAttempts);
+	}
 
 	// 서버가 "쐈다" 고 답하기 전까지는 도착을 기대할 수 없다. 다만 그 답 자체가
 	// 안 올 수도 있으므로(연결이 끊겼다든지) 전체 상한을 따로 둔다.
@@ -1478,9 +1498,8 @@ void UServerSubsystem::PollReachabilityProbe(float DeltaTime)
 
 	ProbeWaitSeconds += DeltaTime;
 
-	// 5초면 충분하다. 서버는 이미 쐈고, LAN 왕복이 아니라 인터넷 왕복이어도
-	// 그 안에 못 오면 오지 않는 것이다.
-	if (ProbeWaitSeconds >= 5.f)
+	// 공유기 규칙 반영 지연을 포함해 7초 동안 여러 발을 모두 못 받으면 실패다.
+	if (ProbeWaitSeconds >= 7.f)
 	{
 		FinishReachabilityProbe(false,
 			TEXT("공유기가 외부 접속을 넘겨주지 않습니다. 같은 공유기 안의 인원만 참여할 수 있습니다."));
@@ -1499,6 +1518,8 @@ void UServerSubsystem::FinishReachabilityProbe(bool bReachable, const FString& D
 	bProbeDispatched  = false;
 	ProbeWaitSeconds  = 0.f;
 	ProbeTotalSeconds = 0.f;
+	ProbeRetrySeconds = 0.f;
+	ProbeRequestAttempts = 0;
 	ProbeNonce        = 0;
 
 	UE_CLOG(bReachable, LogMOUServer, Log,

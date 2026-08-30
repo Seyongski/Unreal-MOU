@@ -876,6 +876,9 @@ private:
 	bool   bProbeDispatched = false;
 	/** HostProbeSent 를 기다리는 시간까지 포함한 전체 상한. */
 	float  ProbeTotalSeconds = 0.f;
+	/** UPnP 규칙 반영 지연과 UDP 유실에 대비한 재요청 간격/횟수. */
+	float  ProbeRetrySeconds = 0.f;
+	int32  ProbeRequestAttempts = 0;
 	/**
 	 * 게임 포트에 bind 된 UDP 소켓. 셋이 같이 쓴다. (v10 에서 프로브 전용 -> 공용)
 	 *
