@@ -49,9 +49,9 @@
 // [★ WBP 아이콘을 쓸 때의 구조]
 //
 //   UVoiceStatusWidget 과 완전히 같은 원칙이다. C++ 는 상태를 ERadioIconState
-//   하나로 축약해 넘기고, 그림과 색은 WBP 가 정한다.
+//   하나로 축약해 넘기고, 그림은 WBP 가 정한다.
 //
-//     Image        RadioIcon  ← 상태별 그림 (IconBrushes / IconTints 로 지정)
+//     Image        RadioIcon  ← 상태별 그림 (IconBrushes 로 지정)
 //     ProgressBar  BatteryBar ← 배터리 잔량
 //     TextBlock    StatusText ← 진단용 글자
 //
@@ -154,10 +154,6 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MOU|Radio|UI")
 	TMap<ERadioIconState, FSlateBrush> IconBrushes;
-
-	/** 상태별 아이콘 틴트. 비워두면 기존 텍스트 표시가 쓰던 색이 그대로 쓰인다. */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "MOU|Radio|UI")
-	TMap<ERadioIconState, FLinearColor> IconTints;
 
 	/**
 	 * 무전기가 없을 때 위젯을 통째로 숨길지.

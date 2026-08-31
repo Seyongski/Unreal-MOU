@@ -60,6 +60,17 @@ void URadioStatusWidget::NativeConstruct()
 		{
 			if (PC->InputComponent != nullptr)
 			{
+				// NativeConstruct 는 재호출될 수 있고, 일반 HUD 위젯 외에
+				// MOU.Voice.RadioUI 디버그 위젯도 만들어질 수 있다. 둘 다
+				// PlayerController 입력에 Z를 걸면 한 번의 입력으로 전원이
+				// ON -> OFF가 된다. 이 플레이어에는 RadioStatusWidget 계열의
+				// 키 바인딩을 항상 하나만 유지한다.
+				PC->InputComponent->KeyBindings.RemoveAll([](const FInputKeyBinding& Binding)
+				{
+					const UObject* BoundObject = Binding.KeyDelegate.GetUObject();
+					return BoundObject != nullptr && BoundObject->IsA<URadioStatusWidget>();
+				});
+
 				PC->InputComponent->BindKey(PowerToggleKey, IE_Pressed, this, &URadioStatusWidget::HandlePowerKeyPressed);
 
 				// ★ PTT 는 누름과 뗌이 **둘 다** 필요하다. 뗌을 안 걸면 한 번
@@ -199,6 +210,14 @@ void URadioStatusWidget::HandlePowerKeyPressed()
 		return; // 없는 무전기를 켤 수는 없다. 화면에는 이미 "무전기 없음" 이 떠 있다.
 	}
 
+	// 인벤토리의 무전기는 켜진 상태에서 수신만 한다. 전원을 바꾸려면
+	// 반드시 손에 다시 꺼내야 한다.
+	if (!Comp->IsInHand())
+	{
+		RefreshStatusText();
+		return;
+	}
+
 	// 진짜 아이템은 자기 힘으로 서버까지 간다(ARadio::SetPowered 가 Server RPC 를 탄다).
 	if (ARadio* Item = Cast<ARadio>(Comp->GetOwner()))
 	{
@@ -228,16 +247,25 @@ void URadioStatusWidget::HandlePowerKeyPressed()
 
 void URadioStatusWidget::HandleTransmitKeyPressed()
 {
-	// 손에 들었는지 / 켜져 있는지는 **여기서 막지 않는다.** 서버가
-	// UVoiceRouter::FindUsableRadioFor 에서 다시 확인하므로, 클라에서 미리
-	// 거르면 판정이 두 군데로 갈라져 어긋나기만 한다(ARadio::StartTransmit 주석).
-	//
-	// 대신 화면에는 왜 안 나가는지를 표시해 준다(RefreshStatusText 의 경고 줄).
+	URadioComponent* Comp = FindLocalRadioComponent();
+
+	// 인벤토리에서는 수신만 허용한다. 로컬 송신 요청 상태도 켜지 않게 해야
+	// UI가 "송신 중"으로 잘못 표시되거나 의도치 않은 송신이 생기지 않는다.
+	if (Comp == nullptr || !Comp->IsInHand() || !Comp->IsPoweredOn())
+	{
+		if (UVoiceSubsystem* Voice = GetVoiceSubsystem())
+		{
+			Voice->SetRadioTransmitting(false);
+		}
+		RefreshStatusText();
+		return;
+	}
+
 	if (ARadio* Item = FindLocalRadioItem())
 	{
 		Item->StartTransmit();
 	}
-	else if (FindLocalRadioComponent() != nullptr)
+	else
 	{
 		// 테스트 무전기. 송신은 어차피 로컬 상태라 서브시스템을 직접 켠다
 		// (ARadio::StartTransmit 이 하는 일과 똑같다).
@@ -245,10 +273,6 @@ void URadioStatusWidget::HandleTransmitKeyPressed()
 		{
 			Voice->SetRadioTransmitting(true);
 		}
-	}
-	else
-	{
-		return; // 무전기가 아예 없다
 	}
 
 	ApplyRadioState(EvaluateRadioState());
@@ -302,10 +326,10 @@ namespace
 	}
 
 	/**
-	 * 상태별 기본 틴트. WBP 의 IconTints 가 비어 있을 때 쓴다.
+	 * 상태 텍스트의 상태별 기본색. 아이콘 색은 변경하지 않는다.
 	 *
 	 * ★ 값은 기존 텍스트 표시가 쓰던 색 그대로다. 이미 화면에서 검증된 색이라
-	 *   새로 정할 이유가 없고, 글자와 아이콘 색이 어긋나지도 않는다.
+	 *   새로 정할 이유가 없다.
 	 */
 	FLinearColor GetDefaultRadioTint(ERadioIconState State)
 	{
@@ -413,8 +437,7 @@ void URadioStatusWidget::ApplyRadioState(ERadioIconState NewState)
 			RadioIcon->SetBrush(*Brush);
 		}
 
-		const FLinearColor* Tint = IconTints.Find(NewState);
-		RadioIcon->SetColorAndOpacity(Tint ? *Tint : GetDefaultRadioTint(NewState));
+		// 상태별 표현은 브러시 교체만 한다. WBP에서 지정한 이미지 색은 보존한다.
 	}
 
 	OnRadioStateChanged(NewState, OldState);
@@ -581,7 +604,7 @@ void URadioStatusWidget::RefreshStatusText()
 	//   다른 우선순위를 쓰면 "아이콘은 송신인데 글자는 수신" 같은 것이 나온다.
 	FString ActionLine;
 
-	// 색도 아이콘과 같은 표에서 가져온다.
+	// 상태 텍스트만 기본색으로 구분한다. 아이콘은 브러시만 바뀐다.
 	FLinearColor Color = GetDefaultRadioTint(State);
 
 	if (bTransmitting)
@@ -594,9 +617,13 @@ void URadioStatusWidget::RefreshStatusText()
 	{
 		ActionLine = TEXT("\n[수신 중] 무전이 들어오고 있다");
 	}
-	else if (!bPowered)
+	else if (!bPowered && bInHand)
 	{
 		ActionLine = FString::Printf(TEXT("\n%s 로 켜기"), *PowerToggleKey.ToString());
+	}
+	else if (!bPowered)
+	{
+		ActionLine = TEXT("\n전원 조작은 손에 들어야 가능");
 	}
 	else if (bInHand)
 	{
